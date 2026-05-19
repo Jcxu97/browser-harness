@@ -159,6 +159,36 @@ doubao_pick(session, idx=2, dst_path="<project>/assets/cat.png")  # 留这张,�
 画布合并 → 真无损,无 inpaint 模糊。源码: `image_gen/doubao.py`,
 方案致谢 github.com/Qalxry/doubao-no-watermark.
 
+## Image generation (GPT image-2 via sub2api)
+
+**付费**通道。OpenAI 兼容 `/v1/images/generations`,model = `gpt-image-2`。
+单张 1024×1024 ≈ **65-70 秒 / ~1.4 MB / ~1756 image_tokens**。
+
+**Default behavior:** 生图请求触发时(出图/生成图片/给我画一张),agent
+**必须先问** "用免费的豆包还是 GPT image-2",不许默认选 GPT(贵)。
+默认走豆包。
+
+```python
+from browser_harness.image_gen import gpt_image_generate, gpt_image_pick
+
+# 需要 env: SUB2API_BASE, SUB2API_KEY
+session = gpt_image_generate(
+    prompt="A minimalist watercolor of a ginkgo leaf...",
+    save_dir="<project>/assets/leaf",
+    n=1, size="1024x1024",
+)
+# 同 doubao.generate 返回 shape: fulls/thumbnails/session_dir/usage/elapsed_sec
+gpt_image_pick(session, idx=0, dst_path="<project>/assets/leaf.png")
+```
+
+不走 second_window — 纯 HTTP `urllib`,跟主 Chrome 无关。Cloudflare 在
+sub2api 前面,**必须**带浏览器 User-Agent(模块默认带了),否则 HTTP 403 / CF 1010。
+
+何时走这条:用户点名 `gpt-image-2`、时间敏感(豆包要 2-3 分钟)、一次只要 1 张、
+要求商用稳定 API 路径。否则走豆包。
+
+实测脚本 + Cloudflare 踩坑细节: `experiments/sub2api-gpt-image2/`。
+
 ## Domain skills (opt-in)
 
 Only applies when `BH_DOMAIN_SKILLS=1`. Otherwise ignore — `agent-workspace/domain-skills/` is dormant and `goto_url` won't surface skill files.
