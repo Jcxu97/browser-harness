@@ -74,10 +74,30 @@ If you start struggling with a specific mechanic while navigating, look in inter
 - profile-sync.md
 - screenshots.md
 - scrolling.md
+- second-window.md
 - shadow-dom.md
 - tabs.md
 - uploads.md
 - viewport.md
+
+## Second-window agent mode
+
+When the user's policy says automation must NOT disturb their main Chrome
+window (no tab steal, no focus theft), use the `second_window` module:
+
+```python
+from browser_harness.second_window import (
+    ensure_agent_tab, navigate_agent, snapshot_agent, screenshot_agent,
+    fill_agent, click_at_agent, save_as_pdf_agent, evaluate_agent,
+)
+
+tid = ensure_agent_tab()  # auto-detect/spawn user's second window
+navigate_agent(tid, url)
+text = snapshot_agent(tid)
+```
+
+See `interaction-skills/second-window.md` for the full API surface and the
+optional zero-focus-steal Chrome extension companion at `extension/`.
 
 ## What actually works
 
@@ -113,6 +133,31 @@ If you start struggling with a specific mechanic while navigating, look in inter
 - Use screenshots to drive exploration. They are often the fastest way to find the next click target, notice hidden blockers, and decide if a selector is even worth writing.
 - Prefer compositor-level actions over framework hacks. Try screenshots, coordinate clicks, and raw key input before adding DOM-specific workarounds.
 - If you need framework-specific DOM tricks, check interaction-skills/ first. That is where dropdown, dialog, iframe, shadow DOM, and form-specific guidance belongs.
+
+## Image generation (Doubao)
+
+Triggers: "用豆包生成一张图" / "出张图" / "doubao_generate" / 用户给 prompt
+要求生成图片素材.
+
+```python
+from browser_harness.image_gen import doubao_generate, doubao_pick
+
+session = doubao_generate(
+    "极简插画风格，一只橘猫坐在窗台上望向夜晚的城市灯光，柔和暖色调",
+    "<project>/assets/cat",  # 图保存目录
+)
+# session['fulls'] = 4 个清晰 PNG (1773×2364, 无水印, 无损双图合并)
+# 用 Read() 多模态预览,挑一张
+doubao_pick(session, idx=2, dst_path="<project>/assets/cat.png")  # 留这张,其余删
+```
+
+走第二 window agent tab,不抢用户主 Chrome 焦点。需要用户已登录豆包
+(cookies 自动复用)。整个流程 ~2-3 分钟 (排队 + 4 张图下载 + 合并)。
+
+水印去除原理:豆包返回两份 URL — `image_pre_watermark`(水印左上) +
+`image_dld_watermark`(水印右下),从 React fiber `realImageInfo` 提取后
+画布合并 → 真无损,无 inpaint 模糊。源码: `image_gen/doubao.py`,
+方案致谢 github.com/Qalxry/doubao-no-watermark.
 
 ## Domain skills (opt-in)
 
