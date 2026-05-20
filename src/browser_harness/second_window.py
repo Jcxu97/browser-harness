@@ -85,17 +85,58 @@ def _save_state(s):
     STATE_FILE.write_text(json.dumps(s, indent=2))
 
 
-def _record_access(tid):
+def _pid_alive(pid):
+    """Check if a PID is still running. Returns True on uncertainty (be conservative)."""
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            # tasklist is slow; use Windows API via ctypes
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+        else:
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        return False
+
+
+def _record_access(tid, claim=False):
+    """Update last_access for tid. If claim=True, also claim it for self pid."""
+    my_pid = os.getpid()
     state = _load_state()
     tabs = state.get("agent_tabs", [])
     for r in tabs:
         if r["tid"] == tid:
             r["last_access"] = time.time()
+            if claim:
+                r["claimed_by_pid"] = my_pid
             _save_state(state)
             return
-    tabs.append({"tid": tid, "last_access": time.time()})
+    rec = {"tid": tid, "last_access": time.time()}
+    if claim:
+        rec["claimed_by_pid"] = my_pid
+    tabs.append(rec)
     state["agent_tabs"] = tabs
     _save_state(state)
+
+
+def _gc_orphan_claims(state):
+    """Mutate state in place: drop claimed_by_pid for dead processes (mark orphan)."""
+    for r in state.get("agent_tabs", []):
+        pid = r.get("claimed_by_pid")
+        if pid and not _pid_alive(pid):
+            r.pop("claimed_by_pid", None)
 
 
 # ---------- CDP attach helpers (no focus steal) ----------
@@ -198,23 +239,28 @@ def spawn_second_window(timeout=10):
 # ---------- LRU pruning ----------
 
 def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
-    """Close oldest agent tabs over max_n. Only touches state-recorded tabs."""
+    """Close oldest agent tabs over max_n. Only prunes tabs claimed by THIS process
+    (or unclaimed orphans whose owner died). Never poaches another live session's tabs."""
+    my_pid = os.getpid()
     state = _load_state()
+    _gc_orphan_claims(state)
     records = state.get("agent_tabs", [])
     targets = cdp("Target.getTargets").get("targetInfos", [])
     live_tids = {t.get("targetId") for t in targets if t.get("type") == "page"}
     live_records = [r for r in records if r["tid"] in live_tids]
-    state["agent_tabs"] = live_records
+    # Keep all records that aren't ours (other sessions own them, orphans are tracked but not closed by us)
+    not_mine = [r for r in live_records if r.get("claimed_by_pid") not in (my_pid, None)]
+    mine_or_orphan = [r for r in live_records if r.get("claimed_by_pid") in (my_pid, None)]
     closed = 0
-    while len(live_records) > max_n:
-        live_records.sort(key=lambda r: r["last_access"])
-        oldest = live_records.pop(0)
+    while len(mine_or_orphan) > max_n:
+        mine_or_orphan.sort(key=lambda r: r["last_access"])
+        oldest = mine_or_orphan.pop(0)
         try:
             cdp("Target.closeTarget", targetId=oldest["tid"])
             closed += 1
         except Exception:
             pass
-    state["agent_tabs"] = live_records
+    state["agent_tabs"] = not_mine + mine_or_orphan
     _save_state(state)
     return closed
 
@@ -246,18 +292,28 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     if not tabs:
         raise RuntimeError(f"second window {second_wid} has no usable tabs")
 
-    # 2. ALWAYS try to reuse existing agent tab first (don't spawn if we can reuse)
+    # 2. Try to reuse a tab CLAIMED BY THIS PROCESS only — never poach another
+    # session's tab (would cause concurrent sessions to fight over one tab,
+    # leading to navigation hijacking. See 2026-05-20 doubao-vs-Nexus incident.)
+    # Use browser-wide live tids (not just second_wid's tabs): detect_second_window
+    # is a flaky heuristic that flips when tab counts shift, so a tab spawned in
+    # round 1 may not appear "in second window" in round 2 even though it's still
+    # live and usable. Filtering by browser-wide live keeps reuse stable.
+    all_targets = cdp("Target.getTargets").get("targetInfos", [])
+    browser_live_tids = {t.get("targetId") for t in all_targets if t.get("type") == "page"}
     state = _load_state()
-    live_tids = {t[0] for t in tabs}
-    candidates = [r for r in state.get("agent_tabs", []) if r["tid"] in live_tids]
-    if candidates:
-        candidates.sort(key=lambda r: r["last_access"], reverse=True)
-        tid = candidates[0]["tid"]
-        _record_access(tid)
+    _gc_orphan_claims(state)  # release tabs whose owner died
+    my_pid = os.getpid()
+    mine = [r for r in state.get("agent_tabs", [])
+            if r["tid"] in browser_live_tids and r.get("claimed_by_pid") == my_pid]
+    if mine:
+        mine.sort(key=lambda r: r["last_access"], reverse=True)
+        tid = mine[0]["tid"]
+        _record_access(tid, claim=True)
         prune_agent_tabs(max_n=max_tabs)
         return tid
 
-    # 3. No existing agent tab — must spawn new in the EXISTING second window.
+    # 3. No tab claimed by us — must spawn a new one (don't poach others' tabs).
     # 3a. Prefer extension path (silent, zero focus steal)
     if prefer_extension:
         try:
@@ -265,7 +321,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             if ext.is_available():
                 tid = ext.spawn_agent_tab_in_window(second_wid)
                 if tid:
-                    _record_access(tid)
+                    _record_access(tid, claim=True)
                     prune_agent_tabs(max_n=max_tabs)
                     return tid
         except Exception:
@@ -292,7 +348,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         raise RuntimeError("Failed to spawn agent tab — popup blocker may have rejected window.open")
     tid = next((t[0] for t in new_in_second if AGENT_TAB_MARKER in t[1]),
                new_in_second[0][0])
-    _record_access(tid)
+    _record_access(tid, claim=True)
     prune_agent_tabs(max_n=max_tabs)
     return tid
 
