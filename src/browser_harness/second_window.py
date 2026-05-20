@@ -327,14 +327,20 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         except Exception:
             pass  # fall through
 
-    # 3b. CDP fallback: window.open from seed tab + focus restore
+    # 3b. CDP fallback: window.open from seed tab + focus restore.
+    # Tag window.open URL with a per-call nonce so concurrent callers don't both
+    # match the same "first new agent tab" (2026-05-20 test: two threads racing
+    # on the same window.open both returned the same tid).
+    import uuid as _uuid
+    nonce = f"{my_pid}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
+    spawn_url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
     main_focus_tid = _capture_main_active_tab()
     seed_tid = tabs[0][0]
     before_tids = {t[0] for t in tabs}
     sid = _attach(seed_tid)
     try:
         cdp("Runtime.evaluate", session_id=sid,
-            expression=f"window.open({json.dumps(AGENT_SPAWN_URL)}, '_blank', 'noopener')",
+            expression=f"window.open({json.dumps(spawn_url)}, '_blank', 'noopener')",
             userGesture=True)
     finally:
         _detach(sid)
@@ -342,12 +348,20 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     time.sleep(1.0)
     _restore_main_focus(main_focus_tid)
 
-    new_in_second = [(t, u, ti) for t, u, ti in _list_windows().get(second_wid, [])
-                     if t not in before_tids]
-    if not new_in_second:
-        raise RuntimeError("Failed to spawn agent tab — popup blocker may have rejected window.open")
-    tid = next((t[0] for t in new_in_second if AGENT_TAB_MARKER in t[1]),
-               new_in_second[0][0])
+    # Match by nonce, not by AGENT_TAB_MARKER (which is shared across calls).
+    # Look browser-wide because window.open may land in main window not second.
+    tid = None
+    for _ in range(8):
+        all_targets = cdp("Target.getTargets").get("targetInfos", [])
+        for t in all_targets:
+            if t.get("type") == "page" and nonce in (t.get("url") or ""):
+                tid = t.get("targetId")
+                break
+        if tid:
+            break
+        time.sleep(0.3)
+    if not tid:
+        raise RuntimeError("Failed to spawn agent tab — nonce never appeared (popup blocker?)")
     _record_access(tid, claim=True)
     prune_agent_tabs(max_n=max_tabs)
     return tid

@@ -102,11 +102,21 @@ def spawn_agent_tab_in_window(window_id, url=None):
 
     Caller must have already verified `window_id` exists. This function does
     NOT detect or create windows — it just creates a tab in a given window.
+
+    Concurrency note: two parallel callers must NOT receive the same targetId
+    (else they'll fight over one tab). We tag the URL with a unique nonce per
+    call so the scan-back step matches only OUR new tab, not someone else's
+    concurrent example.com agent tab.
     """
     if not is_available():
         return None
+    import os, time as _time, uuid as _uuid
     from .second_window import AGENT_SPAWN_URL
-    target_url = url or AGENT_SPAWN_URL
+    base_url = (url or AGENT_SPAWN_URL).split("#")[0]
+    # Append unique nonce so concurrent calls don't collide on URL match
+    nonce = f"bh-nonce={os.getpid()}-{int(_time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
+    sep = "&" if "?" in base_url else "?"
+    target_url = f"{base_url}{sep}{nonce}"
     result = send_command("create_tab",
                           windowId=window_id,
                           url=target_url,
@@ -115,22 +125,22 @@ def spawn_agent_tab_in_window(window_id, url=None):
     if not result or "tabId" not in result:
         return None
 
-    # Map chrome integer tabId → CDP hex targetId via URL+windowId match
+    # Map chrome integer tabId → CDP hex targetId by matching the unique nonce.
     from .helpers import cdp
-    time.sleep(0.4)
+    _time.sleep(0.4)
     targets = cdp("Target.getTargets").get("targetInfos", [])
-    base_url = target_url.split("?")[0]
     for t in targets:
         if t.get("type") != "page":
             continue
-        if base_url in (t.get("url") or ""):
-            try:
-                wid = cdp("Browser.getWindowForTarget",
-                          targetId=t.get("targetId")).get("windowId")
-                if wid == window_id:
-                    return t.get("targetId")
-            except Exception:
-                continue
+        if nonce in (t.get("url") or ""):
+            return t.get("targetId")
+    # Nonce not yet in URL (slow page load); fall back to a brief retry loop
+    for _ in range(8):
+        _time.sleep(0.25)
+        targets = cdp("Target.getTargets").get("targetInfos", [])
+        for t in targets:
+            if t.get("type") == "page" and nonce in (t.get("url") or ""):
+                return t.get("targetId")
     return None
 
 
