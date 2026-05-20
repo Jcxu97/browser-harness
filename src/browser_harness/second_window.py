@@ -20,7 +20,7 @@ Key APIs:
     list_agent_tabs()
     find_agent_tab(url_substring)
     close_agent_tab(tid)
-    prune_agent_tabs(max_n=50)
+    prune_agent_tabs(max_n=25)
 
 Internal:
     detect_second_window()         # heuristic: window with fewest tabs
@@ -63,7 +63,7 @@ CHROME_EXE = _find_chrome_exe()
 
 AGENT_TAB_MARKER = "bh-agent-tab"
 AGENT_SPAWN_URL = f"https://example.com/?{AGENT_TAB_MARKER}=1"
-DEFAULT_MAX_AGENT_TABS = 50  # high — prefer reuse over re-spawn
+DEFAULT_MAX_AGENT_TABS = 25  # cap chosen by user 2026-05-20 — prefer reuse, prune oldest beyond
 SPAWN_FOCUS_WARNING = (
     "[bh.second_window] No second window detected. "
     "Spawning chrome --new-window (OS will steal focus once — unavoidable)."
