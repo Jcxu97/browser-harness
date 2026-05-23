@@ -666,7 +666,16 @@ def evaluate_agent(agent_tid, expression):
     try:
         r = cdp("Runtime.evaluate", session_id=sid, expression=expression)
         _record_access(agent_tid)
-        return r.get("result", {}).get("value")
+        # Match helpers.js() behavior: raise on JS exceptions / parse errors
+        # rather than silently returning None. Without this, eval_js("syntax @#")
+        # or eval_js("undefined.x") returned None and masked user-code bugs.
+        details = r.get("exceptionDetails")
+        result = r.get("result", {}) or {}
+        if details or result.get("subtype") == "error":
+            ex = (details or {}).get("exception", {}) or {}
+            desc = ex.get("description") or result.get("description") or (details or {}).get("text") or "JavaScript error"
+            raise RuntimeError(f"JavaScript evaluation failed: {desc}")
+        return result.get("value")
     finally:
         _detach(sid)
 

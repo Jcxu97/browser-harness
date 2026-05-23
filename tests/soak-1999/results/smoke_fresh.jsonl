@@ -1,0 +1,6 @@
+{"idx": 0, "name": "snap_example", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 3.27, "stdout_tail": "SNAP_OK 17\n", "stderr_tail": "", "expected": "SNAP_OK"}
+{"idx": 1, "name": "snap_zero", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 3.2, "stdout_tail": "SNAP_ZERO_OK ''\n", "stderr_tail": "", "expected": "SNAP_ZERO_OK"}
+{"idx": 2, "name": "unicode_chinese_data_url", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 3.02, "stdout_tail": "CN_OK\n", "stderr_tail": "", "expected": "CN_OK"}
+{"idx": 3, "name": "unicode_chinese_data_url", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 3.13, "stdout_tail": "CN_OK\n", "stderr_tail": "", "expected": "CN_OK"}
+{"idx": 4, "name": "misc_print_only", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 1.31, "stdout_tail": "PRINT_OK no-browser-call\n", "stderr_tail": "", "expected": "PRINT_OK"}
+{"idx": 5, "name": "eval_json_roundtrip", "mode": "fresh", "ok": true, "rc": 0, "elapsed_s": 3.04, "stdout_tail": "JSON_OK\n", "stderr_tail": "", "expected": "JSON_OK"}

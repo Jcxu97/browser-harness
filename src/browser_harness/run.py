@@ -127,14 +127,14 @@ def main():
     # user's main window. Disable with BH_SAFE_MODE=0 if you really need raw
     # helpers (no current task does).
     if os.environ.get("BH_SAFE_MODE", "1") != "0":
-        try:
-            from .bootstrap import safe_globals
-            globals().update(safe_globals())
-        except Exception as _e:
-            # Bootstrap failure must not break BH itself — fall back to raw helpers
-            # but tell the agent loud and clear so they can fix it.
-            import sys as _sys
-            print(f"[bh-safe-mode] bootstrap failed, raw helpers only: {_e!r}", file=_sys.stderr)
+        # Bootstrap binds the safe API (goto/eval_js/snap/...). If it fails and we
+        # silently fall through to exec(), user code that calls goto(...) hits
+        # NameError instead of seeing the real cause (bootstrap raised because of
+        # e.g. a CDP WS handshake timeout under concurrent load). Raise loudly
+        # so the user sees the real failure and can retry. Disable with
+        # BH_SAFE_MODE=0 if a task genuinely needs raw helpers (none currently do).
+        from .bootstrap import safe_globals
+        globals().update(safe_globals())
     exec(code, globals())
 
 

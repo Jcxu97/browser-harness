@@ -78,15 +78,37 @@ def spawn_kwargs():  # subprocess.Popen flags so the daemon detaches from this t
 
 def connect(name, timeout=1.0):
     """Blocking client. Returns (sock, token); token is None on POSIX, hex string on Windows.
-    Callers sending JSON requests MUST include the token as req["token"] on Windows."""
+    Callers sending JSON requests MUST include the token as req["token"] on Windows.
+
+    On Windows, retries on WinError 10048 (WSAEADDRINUSE on connect — the kernel's
+    ephemeral-port pool is exhausted because of TIME_WAIT-state sockets piling up
+    from previous connections). Reproduced 2026-05-24 with 12 concurrent BH
+    subprocesses each making ~5 CDP calls; without retry, ~all but one fail at
+    bootstrap-time `Target.getTargets`. Backoff is short and capped — if the OS
+    is genuinely out of ports for a sustained period we surface the error.
+    """
     if not IS_WINDOWS:
         # uv-Python on Windows lacks socket.AF_UNIX, so this branch must be gated.
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout); s.connect(str(_sock_path(name))); return s, None
     port, token = _read_port_file(name)
     if port is None: raise FileNotFoundError(str(port_path(name)))
-    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-    s.settimeout(timeout); return s, token
+    last_err = None
+    for delay in (0, 0.05, 0.1, 0.2, 0.4, 0.8):
+        if delay:
+            import time as _t; _t.sleep(delay)
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+            s.settimeout(timeout)
+            return s, token
+        except OSError as e:
+            # WSAEADDRINUSE = 10048 (only on Windows). Retry only this one;
+            # any other error (refused, timeout, …) means the daemon is sick
+            # — surface it.
+            if getattr(e, "winerror", None) != 10048:
+                raise
+            last_err = e
+    raise last_err
 
 
 def request(c, token, req):

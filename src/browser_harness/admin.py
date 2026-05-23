@@ -318,9 +318,23 @@ def ensure_daemon(wait=60.0, name=None, env=None):
             env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **ipc.spawn_kwargs(),
         )
         deadline = time.time() + wait
+        # Concurrent BH spawns race the same TCP/AF_UNIX endpoint: only the first
+        # daemon to bind wins, others die immediately on EADDRINUSE. When my own
+        # daemon dies (p.poll() != None), do NOT abort outright — the winning
+        # daemon may still be coming up. Give it a short grace window
+        # (post_death_grace) for the *other* daemon to appear, then bail.
+        # Reproduced 2026-05-24 under 24-parallel BH soak; without this, ~all
+        # but one fail with "daemon didn't come up" even though a valid daemon
+        # is running.
+        post_death_grace = 8.0
+        my_death_at = None
         while time.time() < deadline:
             if daemon_alive(name): return
-            if p.poll() is not None: break
+            if p.poll() is not None:
+                if my_death_at is None:
+                    my_death_at = time.time()
+                elif time.time() - my_death_at > post_death_grace:
+                    break  # nobody else came up either — real failure
             time.sleep(0.2)
         msg = _log_tail(name) or ""
         if local and attempt == 0 and _needs_chrome_remote_debugging_prompt(msg):
