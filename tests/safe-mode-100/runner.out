@@ -1,0 +1,81 @@
+RUN  A01            safe globals injected
+PASS A01            all 11 names present (1.11s)
+RUN  A02            goto real URL
+PASS A02            href contains example.org (1.76s)
+RUN  A03            goto same tab multiple times
+PASS A03            url=example.com & tid unchanged (2.17s)
+RUN  A04            new_tab raises
+PASS A04            RuntimeError with 'disabled' (1.1s)
+RUN  A05            goto_url raises
+PASS A05            RuntimeError with 'disabled' (1.21s)
+RUN  A08            goto invalid URL doesn't crash
+PASS A08            exit 0; either OK or THREW (1.12s)
+RUN  A09            goto then eval_js works
+PASS A09            eval_js returned 2 (1.52s)
+RUN  A10            goto data URL
+PASS A10            h1 text == hi (1.29s)
+RUN  B01            ensure_agent_tab idempotent
+PASS B01            same tid both calls (1.62s)
+RUN  B02            safe_globals idempotent
+PASS B02            same agent_tab across calls (2.08s)
+RUN  B06_setup      B06 setup: bootstrap then exit (placeholder)
+PASS B06_setup      captured tid (1.38s)
+RUN  B06_check      B06 check: prior placeholder gone
+PASS B06_check      placeholder tab removed by atexit (1.15s)
+RUN  B07_setup      B07 setup: goto real then exit
+PASS B07_setup      captured tid (1.59s)
+RUN  B07_check      B07 check: real-URL tab survived
+PASS B07_check      navigated tab survived atexit (1.25s)
+RUN  B09            close_tab forces new tid
+PASS B09            new tid after close (2.1s)
+RUN  C01_setup      C01 setup: placeholder then exit
+PASS C01_setup      captured tid (1.19s)
+RUN  C01_check      C01 check: placeholder gone
+PASS C01_check      placeholder closed (1.19s)
+RUN  C03_setup      C03 setup: KEEP_PLACEHOLDERS=1
+PASS C03_setup      captured tid (1.2s)
+RUN  C03_check      C03 check: placeholder survives KEEP=1
+PASS C03_check      placeholder kept (1.33s)
+RUN  C04            atexit doesn't crash on cdp errors
+PASS C04            exit 0 even with cdp boom (1.29s)
+RUN  C05            exec exception still triggers atexit
+PASS C05            exception printed; atexit fires next (1.46s)
+RUN  C06            close_tab then exit no error
+PASS C06            exit 0 after close_tab (1.35s)
+RUN  C08_pre        C08 pre: write fake other-PID record
+PASS C08_pre        injected fake other-PID record (1.24s)
+RUN  C08_check      C08 check: other-PID record untouched after BH exit
+FAIL C08_check      other-PID record preserved (exit=0 1.28s)
+       stdout: FOUND False
+RUN  C10            atexit double-register guard
+PASS C10            no crash; count printed (2.88s)
+RUN  D01            pinned wid reused across bootstrap
+PASS D01            pinned wid stable (1.69s)
+RUN  D06            spawn lands on bh-agent-tab marker
+PASS D06            agent_tab url has bh-agent-tab marker (1.37s)
+RUN  D07            STATE_FILE has pinned_second_window_id
+PASS D07            pinned_second_window_id present (1.3s)
+RUN  D10            ensure_pinned idempotent x5
+PASS D10            5 calls return same wid (2.51s)
+RUN  E01            DEFAULT_MAX_AGENT_TABS == 15
+PASS E01            constant is 15 (1.25s)
+RUN  E07            close_tab removes record
+PASS E07            tid removed from state after close_tab (1.33s)
+RUN  E09            prune_agent_tabs(5) caps at 5
+PASS E09            prune ran without error (1.54s)
+RUN  F02            multi-goto state preserved
+PASS F02            navigated through both pages (3.2s)
+RUN  F03            localStorage same-origin persists
+PASS F03            localStorage retained across same-origin navs (2.69s)
+RUN  F04            iframe doesn't break main eval_js
+PASS F04            main frame eval works with iframe present (1.66s)
+RUN  F05            eval_js immediately after goto
+PASS F05            eval after goto returns truthy (1.72s)
+RUN  F06            snap on rendered page
+PASS F06            snap returned page text (1.66s)
+RUN  F08            repeat bootstrap doesn't lose cookie jar
+PASS F08            agent_tab stable across repeats (2.55s)
+
+============================================================
+  TOTAL 38  PASS 37  FAIL 1  SKIP 0
+============================================================

@@ -44,6 +44,27 @@ STATE_DIR = pathlib.Path.home() / ".browser-harness"
 STATE_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "second-window-state.json"
 
+# Domain fingerprints — last-resort heuristic used only when neither pin nor
+# extension `focused=True` give an authoritative answer. A window containing
+# ANY user-domain URL is treated as the user's main window — agent tabs MUST
+# NOT spawn there, even if it has more "work" tabs by count.
+USER_DOMAINS = (
+    "bilibili.com", "youtube.com", "douyin.com", "huya.com",
+    "twitch.tv", "weibo.com", "qq.com/", "wegame",
+    "google.com/search", "baidu.com", "zhihu.com",
+    "twitter.com/home", "x.com/home",
+    "/maps", "tieba.baidu",
+    # User's daily-use admin/management surfaces (user told 2026-05-21):
+    "127.0.0.1:8090/admin",  # sub2api admin panel — user opens it on main browser
+    "localhost:8090/admin",
+)
+WORK_DOMAINS = (
+    "nexusmods.com", "doubao.com/chat", "m365.cloud.microsoft",
+    "chat.openai.com", "claude.ai/", "kimi.com", "kimi.moonshot",
+    "example.com/?bh-agent-tab",  # our own marker
+    # Note: NOT "127.0.0.1:" — that's user's admin endpoints; see USER_DOMAINS.
+)
+
 # Locate chrome.exe (Windows). Override via BH_CHROME_EXE env var if needed.
 def _find_chrome_exe():
     env = os.environ.get("BH_CHROME_EXE")
@@ -63,7 +84,7 @@ CHROME_EXE = _find_chrome_exe()
 
 AGENT_TAB_MARKER = "bh-agent-tab"
 AGENT_SPAWN_URL = f"https://example.com/?{AGENT_TAB_MARKER}=1"
-DEFAULT_MAX_AGENT_TABS = 25  # cap chosen by user 2026-05-20 — prefer reuse, prune oldest beyond
+DEFAULT_MAX_AGENT_TABS = 15  # cap chosen by user 2026-05-24 (was 25) — atexit placeholder cleanup means cap is now a backstop, not the primary GC
 SPAWN_FOCUS_WARNING = (
     "[bh.second_window] No second window detected. "
     "Spawning chrome --new-window (OS will steal focus once — unavoidable)."
@@ -111,8 +132,15 @@ def _pid_alive(pid):
         return False
 
 
-def _record_access(tid, claim=False):
-    """Update last_access for tid. If claim=True, also claim it for self pid."""
+def _record_access(tid, claim=False, nonce=None):
+    """Update last_access for tid. If claim=True, also claim it for self pid.
+
+    `nonce` is the unique tag baked into the spawn URL (see I05 fix —
+    bootstrap atexit needs this to distinguish a still-on-placeholder tab
+    from a tab the agent navigated to a URL that happens to contain the
+    AGENT_TAB_MARKER substring). Only set on first record (initial spawn);
+    subsequent _record_access calls preserve the original nonce.
+    """
     my_pid = os.getpid()
     state = _load_state()
     tabs = state.get("agent_tabs", [])
@@ -121,11 +149,15 @@ def _record_access(tid, claim=False):
             r["last_access"] = time.time()
             if claim:
                 r["claimed_by_pid"] = my_pid
+            if nonce and not r.get("nonce"):
+                r["nonce"] = nonce
             _save_state(state)
             return
     rec = {"tid": tid, "last_access": time.time()}
     if claim:
         rec["claimed_by_pid"] = my_pid
+    if nonce:
+        rec["nonce"] = nonce
     tabs.append(rec)
     state["agent_tabs"] = tabs
     _save_state(state)
@@ -153,7 +185,21 @@ def _detach(sid):
 # ---------- focus-steal mitigation ----------
 
 def _detect_main_window():
-    """The window with most tabs is user's daily browsing → main."""
+    """User's main (foreground-focused) window. Prefer extension's `focused`
+    field (authoritative); fall back to tab-count heuristic when extension is
+    unavailable (the heuristic is wrong when second window has more tabs than
+    main, e.g. heavy NexusMods workflow — see 2026-05-20 user incident)."""
+    try:
+        from . import bh_extension_client as ext
+        ext.start_server_if_needed()
+        if ext.is_available():
+            wins = ext.send_command("list_windows", timeout=3)
+            if wins:
+                focused = [w for w in wins if w.get("focused")]
+                if focused:
+                    return focused[0]["id"]
+    except Exception:
+        pass
     windows = _list_windows()
     if not windows:
         return None
@@ -197,43 +243,228 @@ def _list_windows():
     return dict(by_window)
 
 
+def _count_user_hits(urls):
+    """How many tabs in this window match a user-domain fingerprint."""
+    n = 0
+    for u in urls:
+        u = (u or "").lower()
+        for d in USER_DOMAINS:
+            if d in u:
+                n += 1
+                break
+    return n
+
+
+def _count_work_hits(urls):
+    n = 0
+    for u in urls:
+        u = (u or "").lower()
+        for d in WORK_DOMAINS:
+            if d in u:
+                n += 1
+                break
+    return n
+
+
+def pin_second_window(wid):
+    """Pin a windowId as the secondary work window. Highest-priority signal —
+    `detect_second_window` will return this wid as long as the window stays
+    alive in CDP. Use when the heuristic picks wrong."""
+    state = _load_state()
+    state["pinned_second_window_id"] = wid
+    _save_state(state)
+    return wid
+
+
+def unpin_second_window():
+    """Remove the pin so detect_second_window falls back to heuristics."""
+    state = _load_state()
+    state.pop("pinned_second_window_id", None)
+    _save_state(state)
+
+
 def detect_second_window():
     """
     Returns (windowId, [(tid,url,title),...]) for user's secondary window,
     or (None, None) if only 1 window with real tabs exists.
-    Heuristic: fewest non-empty tabs.
+
+    Decision order (HARD RULE: never spawn into user's main window):
+      1. If `state.pinned_second_window_id` is set and that window is alive,
+         return it. Pin > everything.
+      2. Extension reports `focused=True` for exactly one window → that one
+         is the user's main; eliminate it from candidates.
+      3. Among candidates, score by domain content: WORK_DOMAINS hits boost,
+         USER_DOMAINS hits exclude. Any window containing user-domain URLs
+         is REFUSED as a candidate (huya/bilibili/etc. = user is watching).
+      4. If all candidates contain user-domain URLs → raise RuntimeError
+         (refuse to guess; user must `pin_second_window(wid)`).
+
+    Tab-count fallback is dead — the 2026-05-20 incident proved it inverts
+    when the work window outgrows the main window.
     """
-    windows = _list_windows()
-    if len(windows) < 2:
+    state = _load_state()
+    cdp_windows = _list_windows()
+
+    # 1. Pin path — wins over all signals
+    pinned = state.get("pinned_second_window_id")
+    if pinned and pinned in cdp_windows:
+        return pinned, cdp_windows[pinned]
+    if pinned and pinned not in cdp_windows:
+        # Pinned window died — drop the pin and continue to heuristics
+        state.pop("pinned_second_window_id", None)
+        _save_state(state)
+
+    if len(cdp_windows) < 2:
         return None, None
-    sorted_w = sorted(windows.items(), key=lambda kv: len(kv[1]))
-    second_wid, second_tabs = sorted_w[0]
-    return second_wid, second_tabs
+
+    # 2. Build candidate set using extension `focused` if available
+    main_wid_from_ext = None
+    try:
+        from . import bh_extension_client as ext
+        ext.start_server_if_needed()
+        if ext.is_available():
+            wins = ext.send_command("list_windows", timeout=3)
+            if wins:
+                focused = [w for w in wins if w.get("focused")]
+                if len(focused) == 1:
+                    main_wid_from_ext = focused[0]["id"]
+    except Exception:
+        pass
+
+    candidates = [(wid, tabs) for wid, tabs in cdp_windows.items()
+                  if wid != main_wid_from_ext]
+    if not candidates:
+        candidates = list(cdp_windows.items())
+
+    # 3. Domain-content scoring + user-domain exclusion (HARD GUARD).
+    # Tie-breaker: smaller windowId = older window = more likely user's main
+    # (chrome assigns windowIds in creation order; user told 2026-05-21
+    # "main browser is on the left of taskbar" — task-order proxy = wid order).
+    # So: when work_hits is equal, prefer the LARGER wid (newer = more likely
+    # the secondary user opened later for work).
+    def score(wid_tabs):
+        wid, tabs = wid_tabs
+        urls = [t[1] for t in tabs]
+        if _count_user_hits(urls) > 0:
+            return (-10**6, _count_work_hits(urls), wid)
+        return (0, _count_work_hits(urls), wid)
+
+    ranked = sorted(candidates, key=score, reverse=True)
+    chosen_wid, chosen_tabs = ranked[0]
+    chosen_urls = [t[1] for t in chosen_tabs]
+
+    if _count_user_hits(chosen_urls) > 0:
+        # Best candidate still has user content — refuse rather than pollute
+        listing = "\n".join(
+            f"  win={w}  user_hits={_count_user_hits([t[1] for t in ts])}  "
+            f"work_hits={_count_work_hits([t[1] for t in ts])}  tabs={len(ts)}"
+            for w, ts in cdp_windows.items()
+        )
+        raise RuntimeError(
+            "second_window: every chrome window contains user-domain tabs "
+            "(huya/bilibili/youtube/etc.). Refusing to spawn agent tab — "
+            "would pollute user's main window.\n"
+            f"Windows seen:\n{listing}\n"
+            "Fix: open a clean Chrome window for agent work, then call "
+            "browser_harness.second_window.pin_second_window(<wid>)."
+        )
+
+    return chosen_wid, chosen_tabs
 
 
 def spawn_second_window(timeout=10):
-    """Launch new chrome window. Steals focus once (unavoidable). Returns windowId."""
+    """Launch new chrome window, immediately minimize to taskbar.
+
+    Behavior contract (user 2026-05-20):
+      - No screen flash (window doesn't bloom in the middle of the monitor)
+      - No focus steal (user's foreground app stays foreground)
+      - But: window must remain inspectable — user clicks the taskbar icon
+        to peek at automation progress. So we do NOT push it offscreen.
+
+    Strategy: prefer the BH companion extension if reachable
+    (chrome.windows.create with focused:false + state:'minimized' = truly
+    silent birth). Subprocess path is fallback — it briefly shows a small
+    window at a screen corner, then CDP minimize sends it to the taskbar
+    within ~150ms. Focus is restored either way.
+    """
     if not CHROME_EXE:
         raise RuntimeError("chrome.exe not found — set BH_CHROME_EXE env var")
-    print(SPAWN_FOCUS_WARNING)
     main_focus_tid = _capture_main_active_tab()
+
+    # Prefer extension path: zero screen flash, zero focus steal
+    try:
+        from . import bh_extension_client as ext
+        ext.start_server_if_needed()
+        if ext.is_available():
+            res = ext.send_command(
+                "create_window",
+                url="about:blank",
+                state="minimized",
+                focused=False,
+                timeout=8,
+            )
+            if res and res.get("ok"):
+                # Re-discover via CDP since extension's chrome window id != CDP windowId
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    wid = _detect_minimized_blank_window()
+                    if wid is not None:
+                        _restore_main_focus(main_focus_tid)
+                        return wid
+                    time.sleep(0.15)
+    except Exception:
+        pass
+
+    # Fallback: subprocess path. Spawn at corner with modest size so the brief
+    # pre-minimize frame is unobtrusive, then immediately CDP-minimize.
     initial = set(_list_windows().keys())
     subprocess.Popen(
-        [CHROME_EXE, "--new-window", "about:blank"],
+        [
+            CHROME_EXE,
+            "--new-window",
+            "--window-position=20,20",
+            "--window-size=400,300",
+            "about:blank",
+        ],
         creationflags=0x08000000,  # CREATE_NO_WINDOW
     )
     deadline = time.time() + timeout
     new_wid = None
     while time.time() < deadline:
-        time.sleep(0.5)
+        time.sleep(0.15)
         new_wids = set(_list_windows().keys()) - initial
         if new_wids:
             new_wid = new_wids.pop()
             break
+    if new_wid is not None:
+        try:
+            cdp("Browser.setWindowBounds",
+                windowId=new_wid,
+                bounds={"windowState": "minimized"})
+        except Exception:
+            pass
     _restore_main_focus(main_focus_tid)
     if new_wid is None:
         raise RuntimeError("spawn_second_window: timeout")
     return new_wid
+
+
+def _detect_minimized_blank_window():
+    """Find a CDP windowId whose only tab is about:blank (just-spawned second window)."""
+    targets = cdp("Target.getTargets").get("targetInfos", [])
+    by_window = defaultdict(list)
+    for t in targets:
+        if t.get("type") != "page":
+            continue
+        try:
+            wid = cdp("Browser.getWindowForTarget", targetId=t["targetId"]).get("windowId")
+        except Exception:
+            continue
+        by_window[wid].append(t)
+    for wid, ts in by_window.items():
+        if len(ts) == 1 and (ts[0].get("url") or "").startswith("about:blank"):
+            return wid
+    return None
 
 
 # ---------- LRU pruning ----------
@@ -314,14 +545,23 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         return tid
 
     # 3. No tab claimed by us — must spawn a new one (don't poach others' tabs).
-    # 3a. Prefer extension path (silent, zero focus steal)
+    # 3a. Prefer extension path (silent, zero focus steal). Auto-start the
+    # local daemon if it's not running yet — extension polls it within ~30s.
+    # If extension is installed, this path always wins; the window.open
+    # fallback below should never fire in practice.
     if prefer_extension:
         try:
             from . import bh_extension_client as ext
+            ext.start_server_if_needed()
+            # Brief grace period for extension to poll & connect on cold start
+            for _ in range(20):
+                if ext.is_available():
+                    break
+                time.sleep(0.25)
             if ext.is_available():
-                tid = ext.spawn_agent_tab_in_window(second_wid)
+                tid, nonce = ext.spawn_agent_tab_in_window(second_wid)
                 if tid:
-                    _record_access(tid, claim=True)
+                    _record_access(tid, claim=True, nonce=nonce)
                     prune_agent_tabs(max_n=max_tabs)
                     return tid
         except Exception:
@@ -362,7 +602,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         time.sleep(0.3)
     if not tid:
         raise RuntimeError("Failed to spawn agent tab — nonce never appeared (popup blocker?)")
-    _record_access(tid, claim=True)
+    _record_access(tid, claim=True, nonce=nonce)
     prune_agent_tabs(max_n=max_tabs)
     return tid
 

@@ -15,15 +15,17 @@ Domain skills (community-contributed per-site playbooks under `agent-workspace/d
 
 ```bash
 browser-harness <<'PY'
-new_tab("https://docs.browser-use.com")
-wait_for_load()
-print(page_info())
+goto("https://docs.browser-use.com")
+print(eval_js("document.title"))
 PY
 ```
 
 - Invoke as browser-harness — it's on $PATH. No cd, no uv run.
 - Use the heredoc form for every multi-line command. It prevents shell quote mangling inside Python strings and JavaScript snippets.
-- First navigation is new_tab(url), not goto_url(url) — goto runs in the user's active tab and clobbers their work.
+- **Safe-mode is default** (BH_SAFE_MODE=1): `goto / eval_js / snap / shot / click_at / type_text / send_keys / fill / upload / close_tab` and the bound `agent_tab` are pre-injected. They all operate on a pinned second Chrome window — never the user's active window. The legacy `new_tab(url) / goto_url(url)` names are shadowed to the same safe path, so old code keeps working but can no longer pollute the user's window.
+- **atexit cleanup**: when the BH process exits, any tab still on a BH spawn placeholder URL (`example.com/?bh-agent-tab=...`) is auto-closed. Tabs the agent navigated to a real URL are left alone for the next session to reuse. Disable with `BH_KEEP_PLACEHOLDERS=1`.
+- Tab cap `DEFAULT_MAX_AGENT_TABS=15` (was 25) — backstop only; primary GC is the atexit placeholder sweep.
+- Set `BH_SAFE_MODE=0` only if you genuinely need raw helpers that act on the focused tab (currently no task does).
 
 ## Tool call shape
 

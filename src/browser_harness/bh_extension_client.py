@@ -98,7 +98,7 @@ def spawn_agent_tab_in_window(window_id, url=None):
     """
     Create an agent tab in the specified existing window using
     chrome.tabs.create({active:false, windowId:X}). True zero focus steal.
-    Returns CDP targetId (hex), or None on failure.
+    Returns (targetId, nonce) tuple, or (None, None) on failure.
 
     Caller must have already verified `window_id` exists. This function does
     NOT detect or create windows — it just creates a tab in a given window.
@@ -106,10 +106,12 @@ def spawn_agent_tab_in_window(window_id, url=None):
     Concurrency note: two parallel callers must NOT receive the same targetId
     (else they'll fight over one tab). We tag the URL with a unique nonce per
     call so the scan-back step matches only OUR new tab, not someone else's
-    concurrent example.com agent tab.
+    concurrent example.com agent tab. The nonce is also returned so the
+    caller can persist it for placeholder identification at atexit time
+    (substring 'bh-agent-tab' in URL is too loose — see I05 bug).
     """
     if not is_available():
-        return None
+        return None, None
     import os, time as _time, uuid as _uuid
     from .second_window import AGENT_SPAWN_URL
     base_url = (url or AGENT_SPAWN_URL).split("#")[0]
@@ -123,7 +125,7 @@ def spawn_agent_tab_in_window(window_id, url=None):
                           active=False,
                           timeout=10)
     if not result or "tabId" not in result:
-        return None
+        return None, None
 
     # Map chrome integer tabId → CDP hex targetId by matching the unique nonce.
     from .helpers import cdp
@@ -133,15 +135,15 @@ def spawn_agent_tab_in_window(window_id, url=None):
         if t.get("type") != "page":
             continue
         if nonce in (t.get("url") or ""):
-            return t.get("targetId")
+            return t.get("targetId"), nonce
     # Nonce not yet in URL (slow page load); fall back to a brief retry loop
     for _ in range(8):
         _time.sleep(0.25)
         targets = cdp("Target.getTargets").get("targetInfos", [])
         for t in targets:
             if t.get("type") == "page" and nonce in (t.get("url") or ""):
-                return t.get("targetId")
-    return None
+                return t.get("targetId"), nonce
+    return None, None
 
 
 # Back-compat alias (older code may still import this name).
@@ -161,7 +163,8 @@ def ensure_agent_tab_via_extension():
     if len(real) < 2:
         return None
     real.sort(key=lambda kv: len(kv[1]))
-    return spawn_agent_tab_in_window(real[0][0])
+    tid, _nonce = spawn_agent_tab_in_window(real[0][0])
+    return tid
 
 
 def stop_server():

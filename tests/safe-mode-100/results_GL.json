@@ -1,0 +1,382 @@
+{
+  "summary": {
+    "total": 47,
+    "pass": 30,
+    "fail": 0,
+    "skip": 17
+  },
+  "results": {
+    "G04": {
+      "id": "G04",
+      "pass": true,
+      "exit": 0,
+      "stdout": "CAUGHT boom-G04\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.3
+    },
+    "G05": {
+      "id": "G05",
+      "pass": true,
+      "exit": 0,
+      "stdout": "BH_SAFE_MODE 1\r\nHAS_GOTO True\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.34
+    },
+    "G06": {
+      "id": "G06",
+      "pass": true,
+      "exit": 0,
+      "stdout": "EXC TimeoutError\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 6.28
+    },
+    "G07": {
+      "id": "G07",
+      "pass": true,
+      "exit": 0,
+      "stdout": "RET None\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.48
+    },
+    "G08": {
+      "id": "G08",
+      "pass": true,
+      "exit": 0,
+      "stdout": "RET None\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.4
+    },
+    "G09": {
+      "id": "G09",
+      "pass": true,
+      "exit": 0,
+      "stdout": "LEN 0\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.38
+    },
+    "G10": {
+      "id": "G10",
+      "pass": true,
+      "exit": 0,
+      "stdout": "EXC FileNotFoundError\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 2.15
+    },
+    "G11": {
+      "id": "G11",
+      "pass": true,
+      "exit": 0,
+      "stdout": "NO_EXC\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.4
+    },
+    "G12": {
+      "id": "G12",
+      "pass": true,
+      "exit": 0,
+      "stdout": "RET 'no-element'\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.49
+    },
+    "G01": {
+      "id": "G01",
+      "pass": null,
+      "skip": true,
+      "reason": "daemon kill needs cross-process orchestration"
+    },
+    "G02": {
+      "id": "G02",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 daemon level"
+    },
+    "G03": {
+      "id": "G03",
+      "pass": null,
+      "skip": true,
+      "reason": "needs precise tab kill timing \u2014 manual"
+    },
+    "H01": {
+      "id": "H01",
+      "pass": true,
+      "exit": 0,
+      "stdout": "SAFE_MODE 0\r\nHAS_GOTO False\r\nHAS_AGENT_TAB False\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 0.36
+    },
+    "H02": {
+      "id": "H02",
+      "pass": true,
+      "exit": 0,
+      "stdout": "KEEP 1\r\nAGENT_TAB 1700066B2D88\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.25
+    },
+    "H03": {
+      "id": "H03",
+      "pass": true,
+      "exit": 0,
+      "stdout": "UNSET unset\r\nHAS_GOTO True\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.34
+    },
+    "H04": {
+      "id": "H04",
+      "pass": true,
+      "exit": 0,
+      "stdout": "ONE 1\r\nHAS_GOTO True\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.31
+    },
+    "H06": {
+      "id": "H06",
+      "pass": true,
+      "exit": 0,
+      "stdout": "LOWER 0\r\nUPPER 0\r\nHAS_GOTO False\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 0.42
+    },
+    "H05": {
+      "id": "H05",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 code inspection"
+    },
+    "I01": {
+      "id": "I01",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF https://www.example.com/?q=%E6%B5%8B%E8%AF%95\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 2.97
+    },
+    "I02": {
+      "id": "I02",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF https://example.com/#%F0%9F%8E%89\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.82
+    },
+    "I03": {
+      "id": "I03",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF_LEN 2023\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 2.87
+    },
+    "I04": {
+      "id": "I04",
+      "pass": true,
+      "exit": 0,
+      "stdout": "OK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 2.79
+    },
+    "I05_part1": {
+      "id": "I05_part1",
+      "pass": true,
+      "exit": 0,
+      "stdout": "BEFORE_EXIT_TID 91039791EDEE0272BBD0A9ADCCA8182D\r\nBEFORE_EXIT_HREF https://example.com/?bh-agent-tab=spoof\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 2.91
+    },
+    "I05_part2": {
+      "id": "I05_part2",
+      "pass": true,
+      "exit": 0,
+      "stdout": "BUG_CONFIRMED: tab 91039791EDEE was closed by atexit despite agent navigating to real URL\r\nOLD_HREF https://example.com/?bh-agent-tab=spoof\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.42
+    },
+    "I06": {
+      "id": "I06",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF https://example.com/\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.82
+    },
+    "I07": {
+      "id": "I07",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF file:///C:/Windows/win.ini\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.68
+    },
+    "I08": {
+      "id": "I08",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HREF chrome://version/\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.58
+    },
+    "J07": {
+      "id": "J07",
+      "pass": true,
+      "exit": 0,
+      "stdout": "AGENT_TAB 9017E96ECE60\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.36
+    },
+    "J01": {
+      "id": "J01",
+      "pass": null,
+      "skip": true,
+      "reason": "two concurrent BH \u2014 covered by sibling A-F runner naturally"
+    },
+    "J02": {
+      "id": "J02",
+      "pass": null,
+      "skip": true,
+      "reason": "concurrent state file write \u2014 review only"
+    },
+    "J03": {
+      "id": "J03",
+      "pass": null,
+      "skip": true,
+      "reason": "Chrome restart needs manual orchestration"
+    },
+    "J04": {
+      "id": "J04",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 corrupt JSON"
+    },
+    "J05": {
+      "id": "J05",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 missing state file"
+    },
+    "J06": {
+      "id": "J06",
+      "pass": null,
+      "skip": true,
+      "reason": "system reboot \u2014 manual"
+    },
+    "J08": {
+      "id": "J08",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 daemon-stopped exception path"
+    },
+    "K01": {
+      "id": "K01",
+      "pass": true,
+      "exit": 0,
+      "stdout": "TARGETS_KEY True\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.24
+    },
+    "K02": {
+      "id": "K02",
+      "pass": true,
+      "exit": 0,
+      "stdout": "JS 2\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.3
+    },
+    "K03": {
+      "id": "K03",
+      "pass": true,
+      "exit": 0,
+      "stdout": "KEYS ['h', 'ph', 'pw', 'sx', 'sy']\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.45
+    },
+    "K04": {
+      "id": "K04",
+      "pass": true,
+      "exit": 0,
+      "stdout": "LEN 27\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.29
+    },
+    "K05": {
+      "id": "K05",
+      "pass": true,
+      "exit": 0,
+      "stdout": "HITS [('new_tab', True), ('goto_url', True)]\r\nOK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.39
+    },
+    "K06": {
+      "id": "K06",
+      "pass": true,
+      "exit": 0,
+      "stdout": "OK\r\n",
+      "stderr": "",
+      "reason": "",
+      "dur": 1.23
+    },
+    "K07": {
+      "id": "K07",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 SKILL.md grep"
+    },
+    "K08": {
+      "id": "K08",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 agent_helpers grep"
+    },
+    "L01": {
+      "id": "L01",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 SKILL.md vs bootstrap.py"
+    },
+    "L02": {
+      "id": "L02",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 memory frontmatter"
+    },
+    "L03": {
+      "id": "L03",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 last_accessed dates"
+    },
+    "L04": {
+      "id": "L04",
+      "pass": null,
+      "skip": true,
+      "reason": "review only \u2014 MEMORY.md index"
+    }
+  }
+}
