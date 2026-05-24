@@ -6,3 +6,9 @@ uv.lock
 *.egg-info/
 .idea/
 .claude/
+
+# user-local: chrome profile data
+chrome-profile-bid/
+
+# soak test outputs
+tests/soak-1999/results/*.jsonl
