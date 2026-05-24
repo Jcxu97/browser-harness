@@ -14,7 +14,7 @@ dependencies = [
     "websockets==15.0.1",
 ]
 
-[project.scripts]
+[project.gui-scripts]
 browser-harness = "browser_harness.run:main"
 
 [tool.setuptools]
