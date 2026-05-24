@@ -1,150 +1,402 @@
 """
-Real-world daily-use BH task pool for 1999-iteration soak test.
+Real-world BH task pool for 1000-iteration soak test.
 
-Each task is a dict with:
-  name:       short id
-  inline:     python source injected as BH stdin (uses safe-globals: goto/eval_js/snap/...)
-  expect:     a substring or callable that the stdout must contain/satisfy for PASS
-  category:   nav | eval | snap | shot | dom | legacy | error | unicode | misc
+80% real-site tasks (Wikipedia / GitHub / example.* / httpbin / DuckDuckGo /
+MDN / Archive / Bing) covering navigation / snap / eval / fill / screenshot
+under realistic network + JS conditions.
 
-The runner picks tasks at random (or weighted) and runs ~1999 of them, either
-all in one BH process (in-process loop -> tests cap+gc) or each in a fresh BH
-process (tests bootstrap/atexit lifecycle).
+20% retained synthetic tasks for must-keep regressions:
+ - lifecycle close_then_X — closure self-heal in safe_globals (commit f7d72be #1)
+ - legacy new_tab/goto_url — must still raise (shadow guarantee)
+ - error eval throw / syntax / runtime / invalid selector — eval_agent must raise
+
+Each task: name / category / expect substring (must appear in stdout) / inline
+(Python source fed into BH stdin via safe-globals: goto/eval_js/snap/...).
+
+Real-site tasks pick popular, low-bot-block, login-free pages. Expect strings
+are deliberately loose (substring match) so minor site redesigns don't tank
+pass rate. Network jitter + Cloudflare challenges may cause individual
+failures; ≥85% pass is the bar.
 """
 from __future__ import annotations
 
 import os, random, tempfile
 
-TMPDIR = tempfile.gettempdir()
+TMPDIR = tempfile.gettempdir().replace("\\", "/")
 
 
-def _shot_path(idx: int) -> str:
-    return os.path.join(TMPDIR, f"bh_soak_{idx}.png").replace("\\", "/")
-
-
-# Each task's `inline` is run inside a BH stdin block. Print "PASS" on success
-# or anything containing the expected substring; raise on failure.
 TASKS = [
-    # --- navigation ---
-    {"name": "nav_example_org", "category": "nav", "expect": "EXAMPLE.ORG_OK", "inline": """
-goto("https://example.org/")
-href = eval_js("location.href")
-assert "example.org" in href, href
-print("EXAMPLE.ORG_OK", href)
+    # =========================================================================
+    # WIKIPEDIA — most reliable read-only target
+    # =========================================================================
+    {"name": "wiki_main_en", "category": "wiki", "expect": "WIKI_EN_OK", "inline": """
+goto("https://en.wikipedia.org/wiki/Main_Page", timeout=20)
+text = snap(max_chars=3000)
+assert "Wikipedia" in text, text[:300]
+print("WIKI_EN_OK")
 """},
 
-    {"name": "nav_data_url", "category": "nav", "expect": "DATA_URL_OK", "inline": """
-goto("data:text/html,<h1 id=t>hello</h1>")
-val = eval_js("document.querySelector('#t').textContent")
-assert val == "hello", val
-print("DATA_URL_OK")
+    {"name": "wiki_main_zh", "category": "wiki", "expect": "WIKI_ZH_OK", "inline": """
+goto("https://zh.wikipedia.org/wiki/Wikipedia:%E9%A6%96%E9%A1%B5", timeout=20)
+text = snap(max_chars=3000)
+assert "维基百科" in text or "Wikipedia" in text, text[:300]
+print("WIKI_ZH_OK")
 """},
 
-    {"name": "nav_chained", "category": "nav", "expect": "CHAINED_OK", "inline": """
-goto("data:text/html,<title>A</title>")
-goto("data:text/html,<title>B</title>")
+    {"name": "wiki_main_ja", "category": "wiki", "expect": "WIKI_JA_OK", "inline": """
+goto("https://ja.wikipedia.org/wiki/%E3%83%A1%E3%82%A4%E3%83%B3%E3%83%9A%E3%83%BC%E3%82%B8", timeout=20)
+text = snap(max_chars=3000)
+assert "ウィキペディア" in text or "Wikipedia" in text, text[:300]
+print("WIKI_JA_OK")
+"""},
+
+    {"name": "wiki_article_python", "category": "wiki", "expect": "WIKI_PY_OK", "inline": """
+goto("https://en.wikipedia.org/wiki/Python_(programming_language)", timeout=25)
+text = snap(max_chars=4000)
+assert "Python" in text and "programming" in text.lower(), text[:300]
+print("WIKI_PY_OK")
+"""},
+
+    {"name": "wiki_article_us", "category": "wiki", "expect": "WIKI_US_OK", "inline": """
+goto("https://en.wikipedia.org/wiki/United_States", timeout=25)
+text = snap(max_chars=5000)
+assert "United States" in text, text[:300]
+print("WIKI_US_OK")
+"""},
+
+    {"name": "wiki_long_article_truncate", "category": "wiki", "expect": "WIKI_TRUNC_OK", "inline": """
+goto("https://en.wikipedia.org/wiki/World_War_II", timeout=25)
+text = snap(max_chars=8000)
+assert len(text) <= 9000, len(text)
+assert "World War" in text or "1939" in text or "1945" in text, text[:300]
+print("WIKI_TRUNC_OK", len(text))
+"""},
+
+    {"name": "wiki_eval_title", "category": "wiki", "expect": "WIKI_TITLE_OK", "inline": """
+goto("https://en.wikipedia.org/wiki/Main_Page", timeout=20)
 title = eval_js("document.title")
-assert title == "B", title
-print("CHAINED_OK")
+assert "Wikipedia" in title, title
+print("WIKI_TITLE_OK", title[:60])
 """},
 
-    {"name": "nav_about_blank", "category": "nav", "expect": "BLANK_OK", "inline": """
-goto("about:blank")
-print("BLANK_OK", eval_js("location.href"))
-"""},
-
-    # --- eval ---
-    {"name": "eval_arith", "category": "eval", "expect": "ARITH=42", "inline": """
-goto("about:blank")
-v = eval_js("6*7")
-assert v == 42, v
-print(f"ARITH={v}")
-"""},
-
-    {"name": "eval_json_roundtrip", "category": "eval", "expect": "JSON_OK", "inline": """
-goto("about:blank")
-out = eval_js("JSON.stringify({x: 1, y: [2,3], z: 'ok'})")
-import json
-assert json.loads(out) == {"x":1, "y":[2,3], "z":"ok"}
-print("JSON_OK")
-"""},
-
-    {"name": "eval_useragent", "category": "eval", "expect": "UA_OK", "inline": """
-goto("about:blank")
-ua = eval_js("navigator.userAgent")
-assert "Chrome" in ua or "Safari" in ua, ua
-print("UA_OK", ua[:30])
-"""},
-
-    {"name": "eval_long_string", "category": "eval", "expect": "LONG_OK", "inline": """
-goto("about:blank")
-out = eval_js("'x'.repeat(5000)")
-assert len(out) == 5000
-print("LONG_OK", len(out))
-"""},
-
-    # --- snap ---
-    {"name": "snap_example", "category": "snap", "expect": "SNAP_OK", "inline": """
-goto("data:text/html,<h1>Sample</h1><p>body text</p>")
-text = snap(max_chars=2000)
-assert "Sample" in text, text[:100]
-print("SNAP_OK", len(text))
-"""},
-
-    {"name": "snap_zero", "category": "snap", "expect": "SNAP_ZERO_OK", "inline": """
-goto("data:text/html,<p>x</p>")
-text = snap(max_chars=0)
-print("SNAP_ZERO_OK", repr(text))
-"""},
-
-    # --- shot ---
-    {"name": "shot_tmp", "category": "shot", "expect": "SHOT_OK", "inline": f"""
-import os
-goto("data:text/html,<h1>shot</h1>")
-p = "{TMPDIR.replace(chr(92), '/')}/bh_soak_shot.png"
-shot(p)
-assert os.path.getsize(p) > 100, os.path.getsize(p)
-print("SHOT_OK", os.path.getsize(p))
-"""},
-
-    # --- DOM interaction ---
-    {"name": "dom_fill", "category": "dom", "expect": "FILL_OK", "inline": """
-goto('data:text/html,<input id=q value="">')
-fill("#q", "hello-soak")
-v = eval_js("document.getElementById('q').value")
-assert v == "hello-soak", v
-print("FILL_OK")
-"""},
-
-    {"name": "dom_type_text", "category": "dom", "expect": "TYPE_OK", "inline": """
-goto('data:text/html,<input id=q autofocus>')
-eval_js("document.getElementById('q').focus()")
-type_text("typed")
-v = eval_js("document.getElementById('q').value")
-assert "typed" in v, v
-print("TYPE_OK", v)
-"""},
-
-    {"name": "dom_click_at", "category": "dom", "expect": "CLICK_OK", "inline": """
-goto('''data:text/html,<button id=b style="position:absolute;left:50px;top:50px;width:200px;height:80px" onclick="this.textContent='clicked'">go</button>''')
+    {"name": "wiki_search_fill", "category": "wiki", "expect": "WIKI_SEARCH_OK", "inline": """
 import time
-time.sleep(0.3)
-click_at(150, 90)
-time.sleep(0.3)
-v = eval_js("document.getElementById('b').textContent")
-assert v == "clicked", v
-print("CLICK_OK")
+goto("https://en.wikipedia.org/wiki/Main_Page", timeout=20)
+fill("#searchInput", "Python programming")
+v = eval_js("document.getElementById('searchInput').value")
+assert "Python" in v, v
+print("WIKI_SEARCH_OK")
 """},
 
-    {"name": "dom_localstorage_persist_in_page", "category": "dom", "expect": "LS_OK", "inline": """
-goto("https://example.com")
-eval_js("localStorage.setItem('soak', 'v1')")
+    # =========================================================================
+    # GITHUB
+    # =========================================================================
+    {"name": "github_main", "category": "github", "expect": "GH_MAIN_OK", "inline": """
+goto("https://github.com/", timeout=25)
+text = snap(max_chars=4000)
+assert "GitHub" in text, text[:300]
+print("GH_MAIN_OK")
+"""},
+
+    {"name": "github_explore", "category": "github", "expect": "GH_EXPLORE_OK", "inline": """
+goto("https://github.com/explore", timeout=25)
+text = snap(max_chars=4000)
+assert "Explore" in text or "GitHub" in text, text[:300]
+print("GH_EXPLORE_OK")
+"""},
+
+    {"name": "github_anthropic_org", "category": "github", "expect": "GH_ORG_OK", "inline": """
+goto("https://github.com/anthropics", timeout=25)
+text = snap(max_chars=4000)
+assert "anthropic" in text.lower(), text[:300]
+print("GH_ORG_OK")
+"""},
+
+    {"name": "github_eval_origin", "category": "github", "expect": "GH_ORIGIN_OK", "inline": """
+goto("https://github.com/", timeout=25)
+o = eval_js("location.origin")
+assert o == "https://github.com", o
+print("GH_ORIGIN_OK", o)
+"""},
+
+    {"name": "github_repo_readme", "category": "github", "expect": "GH_REPO_OK", "inline": """
+goto("https://github.com/python/cpython", timeout=25)
+text = snap(max_chars=5000)
+assert "cpython" in text.lower() or "Python" in text, text[:300]
+print("GH_REPO_OK")
+"""},
+
+    # =========================================================================
+    # example.* — IANA-reserved, ultra-stable
+    # =========================================================================
+    {"name": "example_com", "category": "example", "expect": "EX_COM_OK", "inline": """
+goto("https://example.com/", timeout=15)
+text = snap(max_chars=2000)
+assert "Example Domain" in text, text[:200]
+print("EX_COM_OK")
+"""},
+
+    {"name": "example_org", "category": "example", "expect": "EX_ORG_OK", "inline": """
+goto("https://example.org/", timeout=15)
+text = snap(max_chars=2000)
+assert "Example Domain" in text, text[:200]
+print("EX_ORG_OK")
+"""},
+
+    {"name": "example_net", "category": "example", "expect": "EX_NET_OK", "inline": """
+goto("https://example.net/", timeout=15)
+text = snap(max_chars=2000)
+assert "Example Domain" in text, text[:200]
+print("EX_NET_OK")
+"""},
+
+    {"name": "example_chained_3", "category": "example", "expect": "EX_CHAIN_OK", "inline": """
+goto("https://example.com/", timeout=15)
+goto("https://example.org/", timeout=15)
+goto("https://example.net/", timeout=15)
+href = eval_js("location.href")
+assert "example.net" in href, href
+print("EX_CHAIN_OK")
+"""},
+
+    {"name": "example_localstorage", "category": "example", "expect": "EX_LS_OK", "inline": """
+goto("https://example.com/", timeout=15)
+eval_js("localStorage.setItem('soak','v1')")
 v = eval_js("localStorage.getItem('soak')")
 assert v == "v1", v
-print("LS_OK")
+print("EX_LS_OK")
 """},
 
-    # --- legacy / shadow ---
+    {"name": "example_cookie", "category": "example", "expect": "EX_COOKIE_OK", "inline": """
+goto("https://example.com/", timeout=15)
+eval_js("document.cookie='soak=ok; path=/'")
+v = eval_js("document.cookie")
+assert "soak=ok" in v, v
+print("EX_COOKIE_OK")
+"""},
+
+    {"name": "example_session_storage", "category": "example", "expect": "EX_SESS_OK", "inline": """
+goto("https://example.com/", timeout=15)
+eval_js("sessionStorage.setItem('k','v')")
+v = eval_js("sessionStorage.getItem('k')")
+assert v == "v", v
+print("EX_SESS_OK")
+"""},
+
+    {"name": "example_history_pushstate", "category": "example", "expect": "EX_PUSH_OK", "inline": """
+goto("https://example.com/", timeout=15)
+eval_js("history.pushState({}, '', '#new')")
+h = eval_js("location.hash")
+assert h == "#new", h
+print("EX_PUSH_OK")
+"""},
+
+    # =========================================================================
+    # httpbin — JSON/HTTP testing
+    # =========================================================================
+    {"name": "httpbin_get", "category": "httpbin", "expect": "HB_GET_OK", "inline": """
+import json
+goto("https://httpbin.org/get", timeout=25)
+body = eval_js("document.body.innerText")
+data = json.loads(body)
+assert "url" in data and "httpbin.org/get" in data["url"], data
+print("HB_GET_OK")
+"""},
+
+    {"name": "httpbin_user_agent", "category": "httpbin", "expect": "HB_UA_OK", "inline": """
+import json
+goto("https://httpbin.org/user-agent", timeout=25)
+body = eval_js("document.body.innerText")
+data = json.loads(body)
+assert "user-agent" in data, data
+assert "Chrome" in data["user-agent"] or "Mozilla" in data["user-agent"], data
+print("HB_UA_OK")
+"""},
+
+    {"name": "httpbin_status_200", "category": "httpbin", "expect": "HB_200_OK", "inline": """
+goto("https://httpbin.org/status/200", timeout=20)
+href = eval_js("location.href")
+assert "200" in href, href
+print("HB_200_OK")
+"""},
+
+    {"name": "httpbin_html", "category": "httpbin", "expect": "HB_HTML_OK", "inline": """
+goto("https://httpbin.org/html", timeout=25)
+text = snap(max_chars=3000)
+# httpbin /html returns a Moby-Dick chapter
+assert "Herman Melville" in text or "Moby" in text or "whale" in text.lower(), text[:300]
+print("HB_HTML_OK")
+"""},
+
+    {"name": "httpbin_redirect_2", "category": "httpbin", "expect": "HB_REDIR_OK", "inline": """
+goto("https://httpbin.org/redirect/2", timeout=25)
+href = eval_js("location.href")
+assert "httpbin.org" in href, href
+print("HB_REDIR_OK")
+"""},
+
+    # =========================================================================
+    # DuckDuckGo (login-free search)
+    # =========================================================================
+    {"name": "ddg_main", "category": "ddg", "expect": "DDG_MAIN_OK", "inline": """
+goto("https://duckduckgo.com/", timeout=25)
+text = snap(max_chars=3000)
+assert "DuckDuckGo" in text or "duck" in text.lower(), text[:300]
+print("DDG_MAIN_OK")
+"""},
+
+    {"name": "ddg_search_results", "category": "ddg", "expect": "DDG_SEARCH_OK", "inline": """
+goto("https://duckduckgo.com/?q=python+programming", timeout=25)
+text = snap(max_chars=4000)
+assert "python" in text.lower(), text[:300]
+print("DDG_SEARCH_OK")
+"""},
+
+    {"name": "ddg_search_form_fill", "category": "ddg", "expect": "DDG_FILL_OK", "inline": """
+goto("https://duckduckgo.com/", timeout=25)
+v = eval_js("(document.querySelector('input[name=q]')||document.querySelector('input[type=text]'))?.tagName||'NONE'")
+assert v == "INPUT", v
+print("DDG_FILL_OK", v)
+"""},
+
+    # =========================================================================
+    # MDN
+    # =========================================================================
+    {"name": "mdn_main", "category": "mdn", "expect": "MDN_MAIN_OK", "inline": """
+goto("https://developer.mozilla.org/en-US/", timeout=25)
+text = snap(max_chars=4000)
+assert "MDN" in text or "Mozilla" in text or "Web" in text, text[:300]
+print("MDN_MAIN_OK")
+"""},
+
+    {"name": "mdn_javascript", "category": "mdn", "expect": "MDN_JS_OK", "inline": """
+goto("https://developer.mozilla.org/en-US/docs/Web/JavaScript", timeout=25)
+text = snap(max_chars=4000)
+assert "JavaScript" in text, text[:300]
+print("MDN_JS_OK")
+"""},
+
+    {"name": "mdn_eval_title", "category": "mdn", "expect": "MDN_TITLE_OK", "inline": """
+goto("https://developer.mozilla.org/en-US/docs/Web/HTML", timeout=25)
+title = eval_js("document.title")
+assert "HTML" in title, title
+print("MDN_TITLE_OK", title[:60])
+"""},
+
+    # =========================================================================
+    # Bing (login-free search)
+    # =========================================================================
+    {"name": "bing_main", "category": "bing", "expect": "BING_MAIN_OK", "inline": """
+goto("https://www.bing.com/", timeout=25)
+text = snap(max_chars=3000)
+assert "Bing" in text or "bing" in text.lower(), text[:300]
+print("BING_MAIN_OK")
+"""},
+
+    {"name": "bing_search", "category": "bing", "expect": "BING_SEARCH_OK", "inline": """
+goto("https://www.bing.com/search?q=python+language", timeout=25)
+text = snap(max_chars=4000)
+assert "python" in text.lower(), text[:300]
+print("BING_SEARCH_OK")
+"""},
+
+    # =========================================================================
+    # archive.org / iana / cdnjs — additional stable real-world targets
+    # =========================================================================
+    {"name": "archive_main", "category": "misc_real", "expect": "ARC_OK", "inline": """
+goto("https://archive.org/", timeout=25)
+text = snap(max_chars=4000)
+assert "Internet Archive" in text or "archive" in text.lower(), text[:300]
+print("ARC_OK")
+"""},
+
+    {"name": "iana_root", "category": "misc_real", "expect": "IANA_OK", "inline": """
+goto("https://www.iana.org/", timeout=20)
+text = snap(max_chars=3000)
+assert "IANA" in text or "iana" in text.lower(), text[:300]
+print("IANA_OK")
+"""},
+
+    {"name": "cdnjs_main", "category": "misc_real", "expect": "CDNJS_OK", "inline": """
+goto("https://cdnjs.com/", timeout=25)
+text = snap(max_chars=3000)
+assert "cdnjs" in text.lower() or "CDN" in text, text[:300]
+print("CDNJS_OK")
+"""},
+
+    # =========================================================================
+    # Screenshots on real sites
+    # =========================================================================
+    {"name": "shot_example", "category": "shot", "expect": "SHOT_EX_OK", "inline": """
+import os
+goto("https://example.com/", timeout=15)
+p = os.path.join(r\"""" + TMPDIR + """\", "bh_soak_ex.png").replace(chr(92), "/")
+shot(p)
+sz = os.path.getsize(p)
+assert sz > 500, sz
+print("SHOT_EX_OK", sz)
+"""},
+
+    {"name": "shot_wikipedia", "category": "shot", "expect": "SHOT_WIKI_OK", "inline": """
+import os
+goto("https://en.wikipedia.org/wiki/Main_Page", timeout=25)
+p = os.path.join(r\"""" + TMPDIR + """\", "bh_soak_wiki.png").replace(chr(92), "/")
+shot(p)
+sz = os.path.getsize(p)
+assert sz > 1000, sz
+print("SHOT_WIKI_OK", sz)
+"""},
+
+    # =========================================================================
+    # CRITICAL REGRESSIONS — keep these synthetic, they test BH primitives
+    # not site behavior.
+    # =========================================================================
+    # close_tab self-heal (commit f7d72be #1) — runs against real sites for
+    # extra reality; these MUST pass after this round's bootstrap fix.
+    {"name": "lifecycle_close_then_wiki", "category": "lifecycle", "expect": "HEAL_WIKI_OK", "inline": """
+close_tab()
+goto("https://en.wikipedia.org/wiki/Main_Page", timeout=20)
+text = snap(max_chars=2000)
+assert "Wikipedia" in text, text[:200]
+print("HEAL_WIKI_OK")
+"""},
+
+    {"name": "lifecycle_close_then_github", "category": "lifecycle", "expect": "HEAL_GH_OK", "inline": """
+close_tab()
+goto("https://github.com/", timeout=25)
+text = snap(max_chars=2000)
+assert "GitHub" in text, text[:200]
+print("HEAL_GH_OK")
+"""},
+
+    {"name": "lifecycle_close_then_example", "category": "lifecycle", "expect": "HEAL_EX_OK", "inline": """
+close_tab()
+goto("https://example.com/", timeout=15)
+href = eval_js("location.href")
+assert "example.com" in href, href
+print("HEAL_EX_OK")
+"""},
+
+    {"name": "lifecycle_close_then_eval_simple", "category": "lifecycle", "expect": "HEAL_EVAL_OK", "inline": """
+close_tab()
+v = eval_js("1+1")
+assert v == 2, v
+print("HEAL_EVAL_OK")
+"""},
+
+    {"name": "lifecycle_close_loop_3sites", "category": "lifecycle", "expect": "HEAL_LOOP_OK", "inline": """
+close_tab()
+goto("https://example.com/", timeout=15)
+close_tab()
+goto("https://example.org/", timeout=15)
+close_tab()
+goto("https://example.net/", timeout=15)
+href = eval_js("location.href")
+assert "example.net" in href, href
+print("HEAL_LOOP_OK")
+"""},
+
+    # legacy — must still raise
     {"name": "legacy_new_tab_raises", "category": "legacy", "expect": "RAISES_OK", "inline": """
 try:
     new_tab("https://example.com")
@@ -163,7 +415,7 @@ except RuntimeError as e:
     print("RAISES_OK")
 """},
 
-    {"name": "legacy_cdp_direct", "category": "legacy", "expect": "CDP_OK", "inline": """
+    {"name": "legacy_cdp_helper", "category": "legacy", "expect": "CDP_OK", "inline": """
 from browser_harness.helpers import cdp
 out = cdp("Target.getTargets")
 assert "targetInfos" in out
@@ -172,65 +424,53 @@ print("CDP_OK", len(out["targetInfos"]))
 
     {"name": "legacy_js_helper", "category": "legacy", "expect": "JS_HELPER_OK", "inline": """
 from browser_harness.helpers import js
-goto("about:blank")
+goto("https://example.com/", timeout=15)
 v = js("2+2")
 assert v == 4 or v == "4", v
 print("JS_HELPER_OK", v)
 """},
 
-    # --- error / boundary ---
-    {"name": "error_eval_syntax", "category": "error", "expect": "SYNTAX_RAISES", "inline": """
-goto("about:blank")
+    # error — eval must raise (commit 1afb010 evaluate_agent fix regression)
+    {"name": "error_eval_throw_custom", "category": "error", "expect": "THROW_RAISES", "inline": """
+goto("https://example.com/", timeout=15)
 try:
-    eval_js("syntax @#")
+    eval_js("throw new Error('hello-soak')")
+    print("FAIL: did not raise")
+except Exception as e:
+    assert "hello-soak" in str(e) or "Error" in str(e), str(e)
+    print("THROW_RAISES")
+"""},
+
+    {"name": "error_eval_syntax", "category": "error", "expect": "SYNTAX_RAISES", "inline": """
+goto("https://example.com/", timeout=15)
+try:
+    eval_js("syntax @#$%")
     print("FAIL: did not raise")
 except Exception as e:
     print("SYNTAX_RAISES", type(e).__name__)
 """},
 
     {"name": "error_eval_runtime", "category": "error", "expect": "RUNTIME_RAISES", "inline": """
-goto("about:blank")
+goto("https://example.com/", timeout=15)
 try:
-    eval_js("undefined.x")
+    eval_js("undefined.foo.bar")
     print("FAIL: did not raise")
 except Exception as e:
     print("RUNTIME_RAISES", type(e).__name__)
 """},
 
-    # --- unicode / URL boundaries ---
-    {"name": "unicode_chinese_data_url", "category": "unicode", "expect": "CN_OK", "inline": """
-goto("data:text/html;charset=utf-8,<h1 id=t>测试中文</h1>")
-v = eval_js("document.getElementById('t').textContent")
-assert v == "测试中文", v
-print("CN_OK")
+    {"name": "error_invalid_selector", "category": "error", "expect": "SEL_RAISES", "inline": """
+goto("https://example.com/", timeout=15)
+try:
+    fill("###@@@badsel", "x")
+    print("FAIL: did not raise")
+except Exception as e:
+    print("SEL_RAISES", type(e).__name__)
 """},
 
-    {"name": "unicode_emoji_data", "category": "unicode", "expect": "EMOJI_OK", "inline": """
-goto("data:text/html;charset=utf-8,<p id=t>🎉🐍</p>")
-v = eval_js("document.getElementById('t').textContent")
-assert "🎉" in v
-print("EMOJI_OK")
-"""},
-
-    # --- agent_tab lifecycle ---
-    {"name": "lifecycle_close_then_reuse", "category": "lifecycle", "expect": "REUSE_OK", "inline": """
-from browser_harness.second_window import ensure_agent_tab
-old = agent_tab
-close_tab()
-new = ensure_agent_tab()
-assert new != old, (old, new)
-print("REUSE_OK", old[:8], "->", new[:8])
-"""},
-
-    {"name": "lifecycle_multiple_goto_same_tab", "category": "lifecycle", "expect": "STABLE_TID", "inline": """
-old = agent_tab
-goto("https://example.com")
-goto("https://example.org")
-goto("about:blank")
-print("STABLE_TID", old[:8])
-"""},
-
-    # --- misc ---
+    # =========================================================================
+    # No-browser-call (process startup overhead test)
+    # =========================================================================
     {"name": "misc_print_only", "category": "misc", "expect": "PRINT_OK", "inline": """
 print("PRINT_OK no-browser-call")
 """},

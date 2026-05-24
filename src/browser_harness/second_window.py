@@ -32,7 +32,7 @@ chrome.tabs.create({active:false, windowId:X}) for ZERO focus steal. Fallback
 is the CDP `window.open` path with focus-restore mitigation.
 """
 
-import json, time, pathlib, subprocess, base64, os
+import json, time, pathlib, subprocess, base64, os, contextlib
 from collections import defaultdict
 
 from .helpers import cdp
@@ -103,7 +103,55 @@ def _load_state():
 
 
 def _save_state(s):
-    STATE_FILE.write_text(json.dumps(s, indent=2))
+    """Atomic write: tmp + os.replace so concurrent readers never see a torn file."""
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(s, indent=2))
+    os.replace(str(tmp), str(STATE_FILE))
+
+
+_STATE_LOCK_PATH = STATE_DIR / "second-window-state.lock"
+
+
+@contextlib.contextmanager
+def _state_mutex(timeout=15.0):
+    """Cross-process file-lock for STATE read-modify-write.
+
+    Without this, N parallel BH processes each do load→mutate→save concurrently
+    and lose-update each other's records. The TABS still exist in CDP but their
+    STATE records vanish — orphans that prune_agent_tabs can't see, so the
+    DEFAULT_MAX_AGENT_TABS cap silently leaks (3-parallel verify 2026-05-24:
+    STATE.agent_tabs=14 but actual second-window tab count=29).
+
+    Stale lock (mtime > 30s) is reaped — holder probably crashed mid-RMW.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(str(_STATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n{time.time()}".encode())
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - _STATE_LOCK_PATH.stat().st_mtime
+            except FileNotFoundError:
+                age = 0  # released — retry immediately
+                time.sleep(0.005)
+                continue
+            if age > 30:
+                try: _STATE_LOCK_PATH.unlink()
+                except FileNotFoundError: pass
+                continue  # retry the create
+            if time.time() >= deadline:
+                raise RuntimeError(f"STATE mutex held > {timeout}s")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        try: _STATE_LOCK_PATH.unlink()
+        except FileNotFoundError: pass
 
 
 def _pid_alive(pid):
@@ -142,25 +190,26 @@ def _record_access(tid, claim=False, nonce=None):
     subsequent _record_access calls preserve the original nonce.
     """
     my_pid = os.getpid()
-    state = _load_state()
-    tabs = state.get("agent_tabs", [])
-    for r in tabs:
-        if r["tid"] == tid:
-            r["last_access"] = time.time()
-            if claim:
-                r["claimed_by_pid"] = my_pid
-            if nonce and not r.get("nonce"):
-                r["nonce"] = nonce
-            _save_state(state)
-            return
-    rec = {"tid": tid, "last_access": time.time()}
-    if claim:
-        rec["claimed_by_pid"] = my_pid
-    if nonce:
-        rec["nonce"] = nonce
-    tabs.append(rec)
-    state["agent_tabs"] = tabs
-    _save_state(state)
+    with _state_mutex():
+        state = _load_state()
+        tabs = state.get("agent_tabs", [])
+        for r in tabs:
+            if r["tid"] == tid:
+                r["last_access"] = time.time()
+                if claim:
+                    r["claimed_by_pid"] = my_pid
+                if nonce and not r.get("nonce"):
+                    r["nonce"] = nonce
+                _save_state(state)
+                return
+        rec = {"tid": tid, "last_access": time.time()}
+        if claim:
+            rec["claimed_by_pid"] = my_pid
+        if nonce:
+            rec["nonce"] = nonce
+        tabs.append(rec)
+        state["agent_tabs"] = tabs
+        _save_state(state)
 
 
 def _gc_orphan_claims(state):
@@ -204,23 +253,6 @@ def _detect_main_window():
     if not windows:
         return None
     return max(windows.items(), key=lambda kv: len(kv[1]))[0]
-
-
-def _capture_main_active_tab():
-    """Pick a main-window tab to re-activate after spawn (best-effort restore)."""
-    main_wid = _detect_main_window()
-    if main_wid is None:
-        return None
-    return _list_windows().get(main_wid, [(None,)])[0][0]
-
-
-def _restore_main_focus(tid):
-    if not tid:
-        return
-    try:
-        cdp("Target.activateTarget", targetId=tid)
-    except Exception:
-        pass
 
 
 # ---------- window/tab discovery ----------
@@ -270,17 +302,19 @@ def pin_second_window(wid):
     """Pin a windowId as the secondary work window. Highest-priority signal —
     `detect_second_window` will return this wid as long as the window stays
     alive in CDP. Use when the heuristic picks wrong."""
-    state = _load_state()
-    state["pinned_second_window_id"] = wid
-    _save_state(state)
+    with _state_mutex():
+        state = _load_state()
+        state["pinned_second_window_id"] = wid
+        _save_state(state)
     return wid
 
 
 def unpin_second_window():
     """Remove the pin so detect_second_window falls back to heuristics."""
-    state = _load_state()
-    state.pop("pinned_second_window_id", None)
-    _save_state(state)
+    with _state_mutex():
+        state = _load_state()
+        state.pop("pinned_second_window_id", None)
+        _save_state(state)
 
 
 def detect_second_window():
@@ -389,7 +423,15 @@ def spawn_second_window(timeout=10):
     """
     if not CHROME_EXE:
         raise RuntimeError("chrome.exe not found — set BH_CHROME_EXE env var")
-    main_focus_tid = _capture_main_active_tab()
+
+    # NOTE: We deliberately do NOT call _restore_main_focus here (2026-05-24).
+    # The old behavior — capture "main window's first tab" then activateTarget
+    # on it after spawn — was a net negative: it MOVED the user's active tab
+    # to whatever happened to be tab #0 of their main window. User reported
+    # mid-soak: "切了我看的 B 站标签页". Chrome's natural focus-return after
+    # minimize already restores main window to foreground; per-window active
+    # tab is preserved by Chrome itself across minimize/raise. Anything we do
+    # via Target.activateTarget is at best redundant, at worst destructive.
 
     # Prefer extension path: zero screen flash, zero focus steal
     try:
@@ -409,7 +451,6 @@ def spawn_second_window(timeout=10):
                 while time.time() < deadline:
                     wid = _detect_minimized_blank_window()
                     if wid is not None:
-                        _restore_main_focus(main_focus_tid)
                         return wid
                     time.sleep(0.15)
     except Exception:
@@ -443,7 +484,7 @@ def spawn_second_window(timeout=10):
                 bounds={"windowState": "minimized"})
         except Exception:
             pass
-    _restore_main_focus(main_focus_tid)
+    # No _restore_main_focus — see top-of-function note.
     if new_wid is None:
         raise RuntimeError("spawn_second_window: timeout")
     return new_wid
@@ -471,28 +512,66 @@ def _detect_minimized_blank_window():
 
 def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
     """Close oldest agent tabs over max_n. Only prunes tabs claimed by THIS process
-    (or unclaimed orphans whose owner died). Never poaches another live session's tabs."""
+    (or unclaimed orphans whose owner died). Never poaches another live session's tabs.
+
+    Also reaps CDP-only orphans: tabs that exist in the pinned second window but
+    have no STATE record (typically from prior lost-update races before the
+    state mutex was added). Without this, the cap silently leaked under
+    concurrent fresh-mode load.
+    """
     my_pid = os.getpid()
-    state = _load_state()
-    _gc_orphan_claims(state)
-    records = state.get("agent_tabs", [])
     targets = cdp("Target.getTargets").get("targetInfos", [])
     live_tids = {t.get("targetId") for t in targets if t.get("type") == "page"}
-    live_records = [r for r in records if r["tid"] in live_tids]
-    # Keep all records that aren't ours (other sessions own them, orphans are tracked but not closed by us)
-    not_mine = [r for r in live_records if r.get("claimed_by_pid") not in (my_pid, None)]
-    mine_or_orphan = [r for r in live_records if r.get("claimed_by_pid") in (my_pid, None)]
+
+    with _state_mutex():
+        state = _load_state()
+        _gc_orphan_claims(state)
+        records = state.get("agent_tabs", [])
+        live_records = [r for r in records if r["tid"] in live_tids]
+        not_mine = [r for r in live_records if r.get("claimed_by_pid") not in (my_pid, None)]
+        mine_or_orphan = [r for r in live_records if r.get("claimed_by_pid") in (my_pid, None)]
+        victims = []
+        while len(mine_or_orphan) > max_n:
+            mine_or_orphan.sort(key=lambda r: r["last_access"])
+            victims.append(mine_or_orphan.pop(0))
+        state["agent_tabs"] = not_mine + mine_or_orphan
+        _save_state(state)
+
+    # Close outside lock — closeTarget is slow (CDP RTT) and we don't want
+    # other processes blocked on STATE while we wait on the network.
     closed = 0
-    while len(mine_or_orphan) > max_n:
-        mine_or_orphan.sort(key=lambda r: r["last_access"])
-        oldest = mine_or_orphan.pop(0)
+    for v in victims:
         try:
-            cdp("Target.closeTarget", targetId=oldest["tid"])
+            cdp("Target.closeTarget", targetId=v["tid"])
             closed += 1
         except Exception:
             pass
-    state["agent_tabs"] = not_mine + mine_or_orphan
-    _save_state(state)
+
+    # CDP-orphan reap: tabs in second window that no STATE record claims.
+    # Only run when we know the second window — otherwise we'd be guessing.
+    pinned = state.get("pinned_second_window_id")
+    if pinned:
+        try:
+            windows = _list_windows()
+            if pinned in windows:
+                known_tids = {r["tid"] for r in state.get("agent_tabs", []) if r.get("tid")}
+                # Don't touch known tabs OR our spawn placeholder URL during the same cleanup pass.
+                cdp_orphans = [
+                    (tid, url) for (tid, url, _title) in windows[pinned]
+                    if tid not in known_tids and url not in ("about:blank",)
+                ]
+                # Be conservative: only close if window is over the cap. Below cap, leave them.
+                excess = len(windows[pinned]) - max_n
+                if excess > 0:
+                    for tid, _url in cdp_orphans[:excess]:
+                        try:
+                            cdp("Target.closeTarget", targetId=tid)
+                            closed += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass  # best-effort
+
     return closed
 
 
@@ -567,14 +646,21 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         except Exception:
             pass  # fall through
 
-    # 3b. CDP fallback: window.open from seed tab + focus restore.
+    # 3b. CDP fallback: window.open from seed tab. NO focus restore.
     # Tag window.open URL with a per-call nonce so concurrent callers don't both
     # match the same "first new agent tab" (2026-05-20 test: two threads racing
     # on the same window.open both returned the same tid).
+    #
+    # NOTE (2026-05-24): we used to call _restore_main_focus(main_window_first_tab)
+    # twice after window.open. window.open() doesn't change Chrome's active tab
+    # in any window, so there was nothing to restore — but Target.activateTarget
+    # DOES change the targeted tab to active AND raise its window. Net effect:
+    # if user's main window was on tab #5, the "restore" moved them to tab #0
+    # AND raised main window to foreground (interrupting whatever app they had
+    # in the foreground). User incident: "切走了 B 站视频标签页". Removed.
     import uuid as _uuid
     nonce = f"{my_pid}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
     spawn_url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
-    main_focus_tid = _capture_main_active_tab()
     seed_tid = tabs[0][0]
     before_tids = {t[0] for t in tabs}
     sid = _attach(seed_tid)
@@ -584,9 +670,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             userGesture=True)
     finally:
         _detach(sid)
-    _restore_main_focus(main_focus_tid)
     time.sleep(1.0)
-    _restore_main_focus(main_focus_tid)
 
     # Match by nonce, not by AGENT_TAB_MARKER (which is shared across calls).
     # Look browser-wide because window.open may land in main window not second.

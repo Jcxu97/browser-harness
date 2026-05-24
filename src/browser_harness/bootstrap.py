@@ -28,12 +28,17 @@ from __future__ import annotations
 
 import atexit
 import os
+import pathlib
+import time as _time
 
 from . import second_window as _sw
 from .helpers import cdp as _cdp
 
 
-def ensure_pinned_second_window():
+_SPAWN_LOCK_PATH = pathlib.Path.home() / ".browser-harness" / "second-window-spawn.lock"
+
+
+def ensure_pinned_second_window(wait=30.0):
     """Always return a wid for a valid pinned second window.
 
     Resolution order:
@@ -43,6 +48,12 @@ def ensure_pinned_second_window():
 
     Never returns None. Never returns the user's main window (detect_second_window
     raises rather than picking a polluted candidate; we catch and spawn fresh).
+
+    Concurrent BH clients on cold start used to each enter step 3 and spawn
+    their OWN window — user reported 6 new windows during 6-parallel soak
+    (2026-05-24). File-lock so only ONE client spawns; others wait for that
+    spawn's pin to land in STATE_FILE, then return it. Stale lock (>60s
+    mtime) is reaped automatically.
     """
     state = _sw._load_state()
     pinned = state.get("pinned_second_window_id")
@@ -50,16 +61,71 @@ def ensure_pinned_second_window():
     if pinned and pinned in live:
         return pinned
 
+    held_lock = False
     try:
-        wid, _tabs = _sw.detect_second_window()
-    except RuntimeError:
-        wid = None
+        try:
+            _SPAWN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(_SPAWN_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()}\n{_time.time()}".encode())
+            os.close(fd)
+            held_lock = True
+        except FileExistsError:
+            # Someone else is spawning — wait for their pin to land.
+            deadline = _time.time() + wait
+            while _time.time() < deadline:
+                state = _sw._load_state()
+                pinned = state.get("pinned_second_window_id")
+                live = _sw._list_windows()
+                if pinned and pinned in live:
+                    return pinned
+                # Stale lock reaping — holder probably crashed mid-spawn.
+                try:
+                    age = _time.time() - _SPAWN_LOCK_PATH.stat().st_mtime
+                except FileNotFoundError:
+                    age = 0  # released — pin should appear momentarily
+                if age > 60:
+                    try: _SPAWN_LOCK_PATH.unlink()
+                    except FileNotFoundError: pass
+                    try:
+                        fd = os.open(str(_SPAWN_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.write(fd, f"{os.getpid()}\n{_time.time()}".encode())
+                        os.close(fd)
+                        held_lock = True
+                        break
+                    except FileExistsError:
+                        pass
+                _time.sleep(0.3)
+            if not held_lock:
+                # Timed out — last-chance read, otherwise raise.
+                state = _sw._load_state()
+                pinned = state.get("pinned_second_window_id")
+                live = _sw._list_windows()
+                if pinned and pinned in live:
+                    return pinned
+                raise RuntimeError(f"second-window spawn lock held past {wait}s and no pin appeared")
 
-    if not wid:
-        wid = _sw.spawn_second_window()
+        # We hold the lock — actually do the spawn.
+        # Re-check inside the lock (another holder may have just released).
+        state = _sw._load_state()
+        pinned = state.get("pinned_second_window_id")
+        live = _sw._list_windows()
+        if pinned and pinned in live:
+            return pinned
 
-    _sw.pin_second_window(wid)
-    return wid
+        try:
+            wid, _tabs = _sw.detect_second_window()
+        except RuntimeError:
+            wid = None
+
+        if not wid:
+            wid = _sw.spawn_second_window()
+
+        _sw.pin_second_window(wid)
+        return wid
+    finally:
+        if held_lock:
+            try: _SPAWN_LOCK_PATH.unlink()
+            except FileNotFoundError: pass
 
 
 def _close_placeholder_tabs():
@@ -195,6 +261,15 @@ def safe_globals():
     """
     global _atexit_registered
     ensure_pinned_second_window()
+    # Pre-spawn prune — without this, ensure_agent_tab only prunes AFTER it
+    # adds a tab, so peak tab count = N + concurrent_clients before getting
+    # squeezed back to cap. Pre-prune to cap-1 so adding our own keeps total
+    # at cap. User reported 2026-05-24: tab count visibly exceeded the
+    # DEFAULT_MAX_AGENT_TABS=15 cap during 6-parallel soak.
+    try:
+        _sw.prune_agent_tabs(max_n=max(1, _sw.DEFAULT_MAX_AGENT_TABS - 1))
+    except Exception:
+        pass  # best-effort; don't block bootstrap on a CDP hiccup
     tab_box = [_sw.ensure_agent_tab()]
     if not _atexit_registered:
         atexit.register(_close_placeholder_tabs)
