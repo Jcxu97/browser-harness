@@ -168,58 +168,111 @@ def _legacy_goto_url(url, **kw):
 _atexit_registered = False
 
 
+# Errors that mean "the targetId we cached is gone" — close_tab(), tab navigated
+# away on its own, Chrome reloaded, etc. When we see one of these, we rebind to
+# a fresh agent_tab and retry the call once. Any other error surfaces.
+_DEAD_TID_NEEDLES = (
+    "No target with given id found",
+    "Session with given id not found",
+    "Target closed",
+    "Inspected target navigated or closed",
+)
+
+
+def _is_dead_tid(exc):
+    msg = str(exc)
+    return any(needle in msg for needle in _DEAD_TID_NEEDLES)
+
+
 def safe_globals():
-    """Bind a fresh agent tab to convenience helpers, return as dict for globals().update()."""
+    """Bind a fresh agent tab to convenience helpers, return as dict for globals().update().
+
+    The agent_tab targetId is held in a mutable box rather than frozen into each
+    closure — when a call hits a "No target with given id" error (because the user
+    or another task closed the tab), we rebind to a fresh agent_tab and retry
+    once. Without this self-heal, batched runs that include close_tab() poison
+    every subsequent helper call (1999-soak: 113/1600 = 7% failures from this).
+    """
     global _atexit_registered
     ensure_pinned_second_window()
-    tab = _sw.ensure_agent_tab()
+    tab_box = [_sw.ensure_agent_tab()]
     if not _atexit_registered:
         atexit.register(_close_placeholder_tabs)
         _atexit_registered = True
 
+    def _with_self_heal(fn):
+        """Run fn(tab); if the tid is dead, rebind once and retry."""
+        try:
+            return fn(tab_box[0])
+        except Exception as e:
+            if not _is_dead_tid(e):
+                raise
+            tab_box[0] = _sw.ensure_agent_tab()
+            return fn(tab_box[0])
+
     def goto(url, timeout=15):
-        return _sw.navigate_agent(tab, url, timeout=timeout)
+        return _with_self_heal(lambda t: _sw.navigate_agent(t, url, timeout=timeout))
 
     def eval_js(expression):
-        return _sw.evaluate_agent(tab, expression)
+        return _with_self_heal(lambda t: _sw.evaluate_agent(t, expression))
 
     def snap(max_chars=10000):
-        return _sw.snapshot_agent(tab, max_chars=max_chars)
+        return _with_self_heal(lambda t: _sw.snapshot_agent(t, max_chars=max_chars))
 
     def shot(path):
-        return _sw.screenshot_agent(tab, path)
+        return _with_self_heal(lambda t: _sw.screenshot_agent(t, path))
 
     def click_at(x, y, button="left"):
-        return _sw.click_at_agent(tab, x, y, button=button)
+        return _with_self_heal(lambda t: _sw.click_at_agent(t, x, y, button=button))
 
     def type_text(text):
-        return _sw.key_type_agent(tab, text)
+        return _with_self_heal(lambda t: _sw.key_type_agent(t, text))
 
     def send_keys(keys):
-        return _sw.send_keys_agent(tab, keys)
+        return _with_self_heal(lambda t: _sw.send_keys_agent(t, keys))
 
     def fill(selector, value):
-        return _sw.fill_agent(tab, selector, value)
+        return _with_self_heal(lambda t: _sw.fill_agent(t, selector, value))
 
     def upload(selector, file_paths):
-        return _sw.upload_agent(tab, selector, file_paths)
+        return _with_self_heal(lambda t: _sw.upload_agent(t, selector, file_paths))
 
     def close_tab():
-        return _sw.close_agent_tab(tab)
+        # Intentionally not self-healed: closing a tab and immediately rebinding
+        # would defeat the user's explicit intent. The next *other* call (goto,
+        # eval_js, ...) will rebind via _with_self_heal.
+        result = _sw.close_agent_tab(tab_box[0])
+        # Mark dead so the next call definitely rebinds (some BH builds return
+        # success even when CDP closeTarget already lost the session).
+        tab_box[0] = None
+        return result
+
+    def _ensure():
+        if tab_box[0] is None:
+            tab_box[0] = _sw.ensure_agent_tab()
+        return tab_box[0]
+
+    # Wrap every helper so the post-close_tab() rebind kicks in on first reuse.
+    def _wrap(fn_inner):
+        def wrapped(*a, **kw):
+            _ensure()
+            return fn_inner(*a, **kw)
+        return wrapped
 
     return {
-        # bound state
-        "agent_tab": tab,
+        # bound state — initial tid; user code that captures this won't see
+        # post-close rebinds, but the helpers themselves always self-heal.
+        "agent_tab": tab_box[0],
         # safe primary API — what agents should write
-        "goto": goto,
-        "eval_js": eval_js,
-        "snap": snap,
-        "shot": shot,
-        "click_at": click_at,
-        "type_text": type_text,
-        "send_keys": send_keys,
-        "fill": fill,
-        "upload": upload,
+        "goto": _wrap(goto),
+        "eval_js": _wrap(eval_js),
+        "snap": _wrap(snap),
+        "shot": _wrap(shot),
+        "click_at": _wrap(click_at),
+        "type_text": _wrap(type_text),
+        "send_keys": _wrap(send_keys),
+        "fill": _wrap(fill),
+        "upload": _wrap(upload),
         "close_tab": close_tab,
         # Legacy names: raise loudly instead of silently changing semantics.
         "new_tab": _legacy_new_tab,

@@ -233,17 +233,33 @@ class Daemon:
         self.stop = asyncio.Event()
         url = get_ws_url()
         log(f"connecting to {url}")
-        self.cdp = CDPClient(url)
-        try:
-            await self.cdp.start()
-        except Exception as e:
+        # CDP WS handshake retry — under concurrent daemon cold-starts (multi-BH
+        # spawn race), Chrome's debug endpoint occasionally times out the
+        # handshake even when remote debugging is already enabled. The error
+        # surfaces as "timed out during opening handshake" but a fresh attempt
+        # 1-2s later succeeds. Reproduced 2026-05-24 in 1999-soak (12/232 fresh
+        # tasks failed here). Cap retries; a genuinely missing Allow won't be
+        # masked because the prompt path in admin.ensure_daemon still runs.
+        last_err = None
+        for delay in (0, 1.0, 2.0, 3.0):
+            if delay:
+                await asyncio.sleep(delay)
+            self.cdp = CDPClient(url)
+            try:
+                await self.cdp.start()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                log(f"CDP WS handshake attempt failed (will retry): {e}")
+        if last_err is not None:
             if os.environ.get("BU_CDP_WS"):
                 raise RuntimeError(
-                    f"CDP WS handshake failed: {e} -- remote browser WebSocket connection failed. "
+                    f"CDP WS handshake failed: {last_err} -- remote browser WebSocket connection failed. "
                     "This can happen when network policy blocks the connection, the WS URL is wrong or expired, or the remote endpoint is down. "
                     "If you use Browser Use cloud, verify BROWSER_USE_API_KEY and get a fresh URL via start_remote_daemon()."
                 )
-            raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
+            raise RuntimeError(f"CDP WS handshake failed: {last_err} -- click Allow in Chrome if prompted, then retry")
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"

@@ -67,16 +67,25 @@ def run_fresh(task: dict, idx: int, timeout: int = 30) -> dict:
 
 
 def build_batch_inline(picks: list[dict]) -> str:
-    """Concatenate N task bodies into one stdin payload, separated by markers."""
-    parts = []
+    """Concatenate N task bodies into one stdin payload, separated by markers.
+
+    Each task emits its marker to BOTH stdout (for normal pass/fail parsing)
+    AND stderr (for post-mortem when the process dies mid-batch). When run_batch
+    sees TASK_NEVER_REACHED in stdout, the matching stderr marker tells us
+    whether the task started at all — if stderr has marker[i] but stdout doesn't,
+    task i started and BH/daemon crashed inside it; if neither has marker[i],
+    a previous task killed the process before i began.
+    """
+    parts = ["import sys as _sys"]
     for i, t in enumerate(picks):
         marker = f"###BATCH_TASK_{i:04d}|{t['name']}|EXPECT={t['expect']}###"
         parts.append(f"""
-print({marker!r})
+print({marker!r}, flush=True)
+_sys.stderr.write({marker!r} + '\\n'); _sys.stderr.flush()
 try:
 {indent(t['inline'], 4)}
 except Exception as _e:
-    print(f'###BATCH_FAIL|{t["name"]}|' + repr(_e))
+    print(f'###BATCH_FAIL|{t["name"]}|' + repr(_e), flush=True)
 """)
     return "\n".join(parts)
 
