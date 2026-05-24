@@ -289,7 +289,10 @@ print("MDN_TITLE_OK", title[:60])
     {"name": "bing_main", "category": "bing", "expect": "BING_MAIN_OK", "inline": """
 goto("https://www.bing.com/", timeout=25)
 text = snap(max_chars=3000)
-assert "Bing" in text or "bing" in text.lower(), text[:300]
+# Bing redirects to localized domain. Chinese variant often omits "Bing" in
+# visible text but always has navigation hints "国际版" / "Images" / "搜索".
+assert ("Bing" in text or "bing" in text.lower()
+        or "搜索" in text or "国际版" in text or "Images" in text), text[:300]
 print("BING_MAIN_OK")
 """},
 
@@ -303,11 +306,14 @@ print("BING_SEARCH_OK")
     # =========================================================================
     # archive.org / iana / cdnjs — additional stable real-world targets
     # =========================================================================
-    {"name": "archive_main", "category": "misc_real", "expect": "ARC_OK", "inline": """
-goto("https://archive.org/", timeout=25)
-text = snap(max_chars=4000)
-assert "Internet Archive" in text or "archive" in text.lower(), text[:300]
-print("ARC_OK")
+    # archive.org removed 2026-05-24 — Cloudflare-blocks home page from this
+    # network (0/8 pass rate single-thread + multi-thread). Replaced with w3.org
+    # which is similarly stable and not behind a challenge wall.
+    {"name": "w3_main", "category": "misc_real", "expect": "W3_OK", "inline": """
+goto("https://www.w3.org/", timeout=20)
+text = snap(max_chars=3000)
+assert "W3C" in text or "Web" in text, text[:300]
+print("W3_OK")
 """},
 
     {"name": "iana_root", "category": "misc_real", "expect": "IANA_OK", "inline": """

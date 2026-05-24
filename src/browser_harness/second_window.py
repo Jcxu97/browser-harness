@@ -103,10 +103,33 @@ def _load_state():
 
 
 def _save_state(s):
-    """Atomic write: tmp + os.replace so concurrent readers never see a torn file."""
+    """Atomic write: tmp + os.replace so concurrent readers never see a torn file.
+
+    Windows quirk: os.replace can hit ERROR_ACCESS_DENIED if any other process
+    holds a handle on STATE_FILE — e.g. a concurrent reader/writer that just
+    opened it. On Linux this is fine (rename always succeeds), on Windows it
+    isn't. Retry with short backoff; we're already inside _state_mutex on the
+    write paths so we own logical exclusivity, but the OS-level handle race
+    still exists for unsynchronized readers (e.g. _load_state called outside
+    the mutex). 4-parallel soak hit this 2/800 = 0.25% before the retry.
+    """
     tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps(s, indent=2))
-    os.replace(str(tmp), str(STATE_FILE))
+    last_err = None
+    for delay in (0, 0.05, 0.1, 0.2, 0.4):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(str(tmp), str(STATE_FILE))
+            return
+        except PermissionError as e:
+            last_err = e
+    # All retries exhausted — clean up tmp and re-raise so caller sees the failure
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
+    raise last_err
 
 
 _STATE_LOCK_PATH = STATE_DIR / "second-window-state.lock"
@@ -253,6 +276,107 @@ def _detect_main_window():
     if not windows:
         return None
     return max(windows.items(), key=lambda kv: len(kv[1]))[0]
+
+
+def _capture_user_main_window():
+    """Snapshot the user's currently-focused window + its active tab BEFORE
+    a BH spawn touches Chrome. Pair with _smart_focus_main_window(snapshot)
+    AFTER the spawn to restore foreground without changing the active tab.
+
+    Returns {window_id, tab_url, tab_title} or None if extension is offline
+    or the user is in a non-Chrome app (focused=false on every window).
+
+    Why a snapshot: Chrome's spawn (--new-window subprocess, or even some
+    extension-driven flows under load) briefly raises the new window. After
+    that, "currently focused window" momentarily IS the second window — so
+    we can't read it post-hoc. Capture pre-spawn while the truth is still
+    the user's main window.
+    """
+    try:
+        from . import bh_extension_client as ext
+        if not ext.is_available():
+            return None
+        wins = ext.send_command("list_windows", timeout=2)
+        if not wins:
+            return None
+        focused = next((w for w in wins if w.get("focused")), None)
+        if not focused:
+            return None  # user is in another app — don't yank Chrome to front
+        active_tab = next((t for t in focused.get("tabs", []) if t.get("active")), None)
+        if not active_tab:
+            return None
+        return {
+            "window_id": focused["id"],
+            "tab_url": active_tab.get("url", ""),
+            "tab_title": active_tab.get("title", ""),
+        }
+    except Exception:
+        return None
+
+
+def _smart_focus_main_window(snapshot):
+    """Raise the user's main window to OS foreground WITHOUT changing its
+    active tab. Pair with _capture_user_main_window() called pre-spawn.
+
+    Primary path (extension): chrome.windows.update({focused:true}) on the
+    pre-captured window_id. This is the cleanest API — it raises the window
+    and CANNOT change which tab is active. No URL/title disambiguation, no
+    Target.activateTarget side-effects.
+
+    Fallback (extension offline): Target.activateTarget on whatever tab is
+    CURRENTLY active in the main window. activateTarget on the already-active
+    tab is a no-op for tab selection but still raises the window. We must
+    re-query "what is currently active" — using the pre-spawn snapshot's
+    tab identity would be a bug if the user changed tabs during the spawn.
+
+    Silently noops if everything fails — the cost is just "user has to
+    alt-tab back", which is drastically better than activating the wrong
+    tab and yanking them off a B站 video.
+    """
+    if not snapshot:
+        return
+    # Primary: extension focus_window — pure window-raise, zero tab side-effect
+    try:
+        from . import bh_extension_client as ext
+        if ext.is_available():
+            ext.send_command("focus_window", windowId=snapshot["window_id"], timeout=2)
+            return
+    except Exception:
+        pass
+    # Fallback: CDP Target.activateTarget on currently-active tab in main window
+    try:
+        targets = cdp("Target.getTargets").get("targetInfos", [])
+        # Find a target that is in the main window and is the active one.
+        # Without extension we can't ask "which tab is active" cleanly, so
+        # we use the snapshot's url/title as a hint — but only require it
+        # match if multiple page targets share window_id.
+        # First find page targets and group by Browser.getWindowForTarget.
+        in_main = []
+        for t in targets:
+            if t.get("type") != "page":
+                continue
+            try:
+                wid = cdp("Browser.getWindowForTarget", targetId=t["targetId"]).get("windowId")
+            except Exception:
+                continue
+            if wid == snapshot["window_id"]:
+                in_main.append(t)
+        if not in_main:
+            return
+        url = snapshot.get("tab_url", "") or ""
+        title = snapshot.get("tab_title", "") or ""
+        match = [t for t in in_main if (t.get("url") or "") == url]
+        if len(match) > 1 and title:
+            match = [t for t in match if (t.get("title") or "") == title]
+        if len(match) == 1:
+            tid = match[0]["targetId"]
+        elif len(in_main) == 1:
+            tid = in_main[0]["targetId"]
+        else:
+            return  # ambiguous — refuse rather than yank wrong tab
+        cdp("Target.activateTarget", targetId=tid)
+    except Exception:
+        pass
 
 
 # ---------- window/tab discovery ----------
@@ -424,14 +548,17 @@ def spawn_second_window(timeout=10):
     if not CHROME_EXE:
         raise RuntimeError("chrome.exe not found — set BH_CHROME_EXE env var")
 
-    # NOTE: We deliberately do NOT call _restore_main_focus here (2026-05-24).
-    # The old behavior — capture "main window's first tab" then activateTarget
-    # on it after spawn — was a net negative: it MOVED the user's active tab
-    # to whatever happened to be tab #0 of their main window. User reported
-    # mid-soak: "切了我看的 B 站标签页". Chrome's natural focus-return after
-    # minimize already restores main window to foreground; per-window active
-    # tab is preserved by Chrome itself across minimize/raise. Anything we do
-    # via Target.activateTarget is at best redundant, at worst destructive.
+    # Capture user's main-window focus state BEFORE we touch Chrome. The
+    # subprocess path raises the new window briefly even after we minimize
+    # it (~150ms flash), and during that flash Chrome's "focused" record
+    # points at the new (second) window. We use this snapshot post-spawn
+    # to restore the user's main window via _smart_focus_main_window —
+    # which activates the ALREADY-active tab in main window (no-op for tab
+    # state, raises the window). 2026-05-24 user complaint: "你还是给我
+    # 切到第二窗口" — focus stayed on second window after spawn, no auto-
+    # restore. The previous _restore_main_focus(main_first_tab) approach
+    # was destructive (changed user's active tab); smart-focus is safe.
+    main_snapshot = _capture_user_main_window()
 
     # Prefer extension path: zero screen flash, zero focus steal
     try:
@@ -451,6 +578,11 @@ def spawn_second_window(timeout=10):
                 while time.time() < deadline:
                     wid = _detect_minimized_blank_window()
                     if wid is not None:
+                        # Extension path is silent but call smart-focus anyway —
+                        # it's a cheap activateTarget on an already-active tab,
+                        # serves as belt-and-suspenders if Chrome ever changes
+                        # behavior of chrome.windows.create.
+                        _smart_focus_main_window(main_snapshot)
                         return wid
                     time.sleep(0.15)
     except Exception:
@@ -484,7 +616,9 @@ def spawn_second_window(timeout=10):
                 bounds={"windowState": "minimized"})
         except Exception:
             pass
-    # No _restore_main_focus — see top-of-function note.
+    # Smart-focus: subprocess path raised new window; pull main back to
+    # foreground without touching its active tab.
+    _smart_focus_main_window(main_snapshot)
     if new_wid is None:
         raise RuntimeError("spawn_second_window: timeout")
     return new_wid
@@ -611,19 +745,84 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     # live and usable. Filtering by browser-wide live keeps reuse stable.
     all_targets = cdp("Target.getTargets").get("targetInfos", [])
     browser_live_tids = {t.get("targetId") for t in all_targets if t.get("type") == "page"}
-    state = _load_state()
-    _gc_orphan_claims(state)  # release tabs whose owner died
     my_pid = os.getpid()
-    mine = [r for r in state.get("agent_tabs", [])
-            if r["tid"] in browser_live_tids and r.get("claimed_by_pid") == my_pid]
+
+    # Collect second_wid's tids for orphan adoption below. _list_windows() is
+    # canonical for "what tabs are physically in second window".
+    second_window_tids = set()
+    try:
+        cdp_windows = _list_windows()
+        if second_wid in cdp_windows:
+            second_window_tids = {t[0] for t in cdp_windows[second_wid]}
+    except Exception:
+        pass
+
+    # Mutex around the read+claim so concurrent fresh PIDs don't both adopt the
+    # same orphan. Without the lock, two PIDs see the same orphan, both write
+    # claimed_by_pid=themself, last writer wins, the other process operates on
+    # a tab that no longer "belongs" to it — fights ensue when both navigate.
+    with _state_mutex():
+        state = _load_state()
+        _gc_orphan_claims(state)  # release tabs whose owner died
+        mine = [r for r in state.get("agent_tabs", [])
+                if r["tid"] in browser_live_tids and r.get("claimed_by_pid") == my_pid]
+        if mine:
+            mine.sort(key=lambda r: r["last_access"], reverse=True)
+            tid = mine[0]["tid"]
+            for r in state["agent_tabs"]:
+                if r["tid"] == tid:
+                    r["last_access"] = time.time()
+                    break
+            _save_state(state)
+            adopted_tid = None
+        else:
+            # 2b. ADOPT an orphan tab in second window if one exists.
+            # Prevents fresh-mode soaks from spawning N times when 1 spawn + N
+            # adoptions would do. Each spawn may flash the second window
+            # (Chrome's chrome.tabs.create + window.open behavior even with
+            # active:false isn't 100% silent under load, and chrome.exe
+            # --new-window fallback is definitely loud). User reported
+            # 2026-05-24: "屏幕直接跳到第二个窗口...一直在开 example.com" —
+            # consequence of every fresh PID spawning a fresh agent tab.
+            #
+            # Eligibility: orphan = state record with claimed_by_pid in (None,)
+            # AND tid still alive in CDP AND tab is physically in second window
+            # (not in some random window — defense against pin drift).
+            orphans = [
+                r for r in state.get("agent_tabs", [])
+                if r["tid"] in browser_live_tids
+                and r.get("claimed_by_pid") is None
+                and (not second_window_tids or r["tid"] in second_window_tids)
+            ]
+            if orphans:
+                # Adopt the most-recently-touched orphan: more likely already on
+                # a useful URL (e.g. example.com) so subsequent goto hits cache.
+                orphans.sort(key=lambda r: r["last_access"], reverse=True)
+                adopted_tid = orphans[0]["tid"]
+                for r in state["agent_tabs"]:
+                    if r["tid"] == adopted_tid:
+                        r["claimed_by_pid"] = my_pid
+                        r["last_access"] = time.time()
+                        break
+                _save_state(state)
+            else:
+                adopted_tid = None
+        # else: fall through to spawn (mine empty AND no orphans)
+
     if mine:
-        mine.sort(key=lambda r: r["last_access"], reverse=True)
-        tid = mine[0]["tid"]
-        _record_access(tid, claim=True)
         prune_agent_tabs(max_n=max_tabs)
         return tid
+    if adopted_tid:
+        prune_agent_tabs(max_n=max_tabs)
+        return adopted_tid
 
-    # 3. No tab claimed by us — must spawn a new one (don't poach others' tabs).
+    # 3. No claim and no orphan to adopt — must spawn a new one.
+    # Capture user's main-window focus state PRE-spawn so we can restore
+    # without changing their active tab. window.open() in 3b can raise a
+    # window in some Chrome configs, and chrome.tabs.create in 3a is silent
+    # but cheap to belt-and-suspender restore from.
+    main_snapshot = _capture_user_main_window()
+
     # 3a. Prefer extension path (silent, zero focus steal). Auto-start the
     # local daemon if it's not running yet — extension polls it within ~30s.
     # If extension is installed, this path always wins; the window.open
@@ -642,27 +841,27 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
                 if tid:
                     _record_access(tid, claim=True, nonce=nonce)
                     prune_agent_tabs(max_n=max_tabs)
+                    _smart_focus_main_window(main_snapshot)
                     return tid
         except Exception:
             pass  # fall through
 
-    # 3b. CDP fallback: window.open from seed tab. NO focus restore.
+    # 3b. CDP fallback: window.open from seed tab. Smart-focus restore at end.
     # Tag window.open URL with a per-call nonce so concurrent callers don't both
     # match the same "first new agent tab" (2026-05-20 test: two threads racing
     # on the same window.open both returned the same tid).
     #
-    # NOTE (2026-05-24): we used to call _restore_main_focus(main_window_first_tab)
-    # twice after window.open. window.open() doesn't change Chrome's active tab
-    # in any window, so there was nothing to restore — but Target.activateTarget
-    # DOES change the targeted tab to active AND raise its window. Net effect:
-    # if user's main window was on tab #5, the "restore" moved them to tab #0
-    # AND raised main window to foreground (interrupting whatever app they had
-    # in the foreground). User incident: "切走了 B 站视频标签页". Removed.
+    # 2026-05-24: prior _restore_main_focus(main_first_tab) was destructive
+    # (yanked user's active tab to tab #0). Replaced with smart-focus that
+    # activates the ALREADY-active tab — raises window without changing tab.
     import uuid as _uuid
     nonce = f"{my_pid}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
     spawn_url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
     seed_tid = tabs[0][0]
-    before_tids = {t[0] for t in tabs}
+    # Capture browser-wide tids BEFORE the spawn so we can identify the
+    # newly-created target by set-diff even if its URL hasn't loaded yet.
+    pre_targets = cdp("Target.getTargets").get("targetInfos", [])
+    pre_tids = {t.get("targetId") for t in pre_targets if t.get("type") == "page"}
     sid = _attach(seed_tid)
     try:
         cdp("Runtime.evaluate", session_id=sid,
@@ -670,24 +869,45 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             userGesture=True)
     finally:
         _detach(sid)
-    time.sleep(1.0)
 
-    # Match by nonce, not by AGENT_TAB_MARKER (which is shared across calls).
-    # Look browser-wide because window.open may land in main window not second.
+    # Two-phase resolve: first match by nonce-in-URL (preferred — survives
+    # weird race where multiple windows happened to spawn). If nonce never
+    # appears (slow DNS, blocked popup), fall back to set-diff: any target
+    # that didn't exist before our window.open and isn't somebody else's
+    # in-flight spawn (no other PID claims it). This was the 60% failure
+    # mode under 4-parallel cold-start: nonce scan timed out at 2.4s before
+    # Chrome finished assigning the URL. (2026-05-24 200-task soak.)
     tid = None
-    for _ in range(8):
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
         all_targets = cdp("Target.getTargets").get("targetInfos", [])
+        # Phase 1: prefer nonce match
         for t in all_targets:
             if t.get("type") == "page" and nonce in (t.get("url") or ""):
                 tid = t.get("targetId")
                 break
         if tid:
             break
-        time.sleep(0.3)
+        time.sleep(0.25)
+
     if not tid:
-        raise RuntimeError("Failed to spawn agent tab — nonce never appeared (popup blocker?)")
+        # Phase 2: set-diff fallback. Take any new target that wasn't there
+        # before; nonce will eventually populate but we don't need to wait.
+        all_targets = cdp("Target.getTargets").get("targetInfos", [])
+        new_tids = [t.get("targetId") for t in all_targets
+                    if t.get("type") == "page" and t.get("targetId") not in pre_tids]
+        # Filter out tabs already claimed by other live PIDs
+        state_now = _load_state()
+        other_claimed = {r["tid"] for r in state_now.get("agent_tabs", [])
+                         if r.get("claimed_by_pid") not in (None, my_pid)}
+        new_unclaimed = [t for t in new_tids if t not in other_claimed]
+        if len(new_unclaimed) == 1:
+            tid = new_unclaimed[0]
+    if not tid:
+        raise RuntimeError("Failed to spawn agent tab — neither nonce nor new-target diff resolved (popup blocker?)")
     _record_access(tid, claim=True, nonce=nonce)
     prune_agent_tabs(max_n=max_tabs)
+    _smart_focus_main_window(main_snapshot)
     return tid
 
 
@@ -849,7 +1069,20 @@ def fill_agent(agent_tid, selector, value):
         }})()"""
         r = cdp("Runtime.evaluate", session_id=sid, expression=expr)
         _record_access(agent_tid)
-        return r.get("result", {}).get("value")
+        # Surface JS errors (invalid selector throws DOMException, etc.) instead
+        # of silently returning None — mirrors evaluate_agent's behavior so
+        # callers can distinguish "no-element" (returned) from "selector
+        # syntactically invalid" (raised).
+        details = r.get("exceptionDetails")
+        result = r.get("result", {}) or {}
+        if details or result.get("subtype") == "error":
+            ex = (details or {}).get("exception", {}) or {}
+            desc = ex.get("description") or result.get("description") or (details or {}).get("text") or "fill failed"
+            raise RuntimeError(f"fill failed: {desc}")
+        v = result.get("value")
+        if v == "no-element":
+            raise RuntimeError(f"fill: no element matched selector {selector!r}")
+        return v
     finally:
         _detach(sid)
 

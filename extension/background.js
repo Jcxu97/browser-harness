@@ -54,6 +54,16 @@ async function execute(cmd) {
     });
     return { tabId: tab.id, windowId: tab.windowId, url: tab.url };
   }
+  if (a === "create_window") {
+    // Zero-focus-steal window birth: focused:false + state:minimized means
+    // the window appears directly in the taskbar, never on screen.
+    const w = await chrome.windows.create({
+      url: cmd.url || "about:blank",
+      focused: cmd.focused === undefined ? false : cmd.focused,
+      state: cmd.state || "minimized"
+    });
+    return { ok: true, windowId: w.id, state: w.state };
+  }
   if (a === "list_windows") {
     const wins = await chrome.windows.getAll({ populate: true });
     return wins.map(w => ({
@@ -67,6 +77,14 @@ async function execute(cmd) {
         active: t.active
       }))
     }));
+  }
+  if (a === "focus_window") {
+    // Raise window to OS foreground WITHOUT changing its active tab.
+    // chrome.windows.update({focused:true}) is the cleanest "raise without
+    // tab side-effects" API — Target.activateTarget over CDP also raises but
+    // requires picking a target first (and can switch tabs if you pick wrong).
+    await chrome.windows.update(cmd.windowId, { focused: true });
+    return { ok: true };
   }
   if (a === "close_tab") {
     await chrome.tabs.remove(cmd.tabId);

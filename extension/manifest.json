@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Browser-Harness Companion",
-  "version": "0.1.0",
-  "description": "Silent agent tab spawner for browser-harness — uses chrome.tabs.create({active:false}) to avoid focus steal.",
+  "version": "0.3.0",
+  "description": "Silent agent tab + window spawner for browser-harness. Uses chrome.tabs.create({active:false}) and chrome.windows.create({focused:false,state:'minimized'}) to avoid focus steal.",
   "permissions": [
     "tabs",
     "alarms"
