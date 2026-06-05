@@ -203,8 +203,89 @@ def _pid_alive(pid):
         return False
 
 
+# ---------- owner identity (per-Claude-session, not per-PID) ----------
+#
+# Why session-id beats PID: each Bash/Python heredoc fired from a Claude
+# session is a fresh short-lived process. Per-PID claims die with the
+# heredoc, so the "orphan adoption" path lets the NEXT heredoc — which can
+# belong to a *different* Claude session — grab the previous tab. That's
+# exactly the cross-session hijack we hit 2026-05-24 (Nexus upload tab kept
+# getting navigated to baidu pan / asus armoury crate by a parallel
+# session's exe-downloader). CLAUDE_CODE_SESSION_ID is set by Claude Code
+# and inherited by all child processes — gives us stable per-session
+# ownership that survives heredoc churn.
+
+def _get_owner_id():
+    """Stable identity for claim ownership. Prefers Claude Code's session ID
+    (long-lived across all child processes of one Claude session). Falls
+    back to PID for non-Claude callers (manual scripts, tests)."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        return f"session:{sid}"
+    return f"pid:{os.getpid()}"
+
+
+def _owner_alive(owner):
+    """Is the owner of this claim still active? Generic over session/pid."""
+    if not owner:
+        return False
+    # Legacy: integer claimed_by_pid from old state files
+    if isinstance(owner, int):
+        return _pid_alive(owner)
+    if not isinstance(owner, str):
+        return False
+    if owner.startswith("pid:"):
+        try:
+            return _pid_alive(int(owner[4:]))
+        except ValueError:
+            return False
+    if owner.startswith("session:"):
+        sid = owner[8:]
+        # A Claude session is "alive" if its transcript jsonl was modified
+        # recently. Path: ~/.claude/projects/<encoded-cwd>/<sid>.jsonl.
+        # Idle sessions stay open for hours during multi-day work, so use
+        # a generous TTL — the cost of keeping a stale claim is bounded
+        # (one tab not adopted), the cost of dropping a live claim is
+        # cross-session hijack which is much worse.
+        try:
+            projects = pathlib.Path.home() / ".claude" / "projects"
+            if not projects.exists():
+                return True  # can't verify — be conservative
+            for proj in projects.iterdir():
+                jsonl = proj / f"{sid}.jsonl"
+                if jsonl.exists():
+                    age = time.time() - jsonl.stat().st_mtime
+                    return age < 6 * 3600  # 6h idle TTL
+            return False  # session not found in any project
+        except Exception:
+            return True
+    return False
+
+
+def _read_claim(record):
+    """Extract owner identity from a state record, with legacy fallback."""
+    v = record.get("claimed_by")
+    if v:
+        return v
+    pid = record.get("claimed_by_pid")
+    if pid:
+        return f"pid:{pid}"
+    return None
+
+
+def _write_claim(record, owner):
+    """Set owner on a state record (and migrate legacy claimed_by_pid)."""
+    record["claimed_by"] = owner
+    record.pop("claimed_by_pid", None)
+
+
+def _clear_claim(record):
+    record.pop("claimed_by", None)
+    record.pop("claimed_by_pid", None)
+
+
 def _record_access(tid, claim=False, nonce=None):
-    """Update last_access for tid. If claim=True, also claim it for self pid.
+    """Update last_access for tid. If claim=True, also claim it for self owner.
 
     `nonce` is the unique tag baked into the spawn URL (see I05 fix —
     bootstrap atexit needs this to distinguish a still-on-placeholder tab
@@ -212,7 +293,7 @@ def _record_access(tid, claim=False, nonce=None):
     AGENT_TAB_MARKER substring). Only set on first record (initial spawn);
     subsequent _record_access calls preserve the original nonce.
     """
-    my_pid = os.getpid()
+    my_owner = _get_owner_id()
     with _state_mutex():
         state = _load_state()
         tabs = state.get("agent_tabs", [])
@@ -220,14 +301,14 @@ def _record_access(tid, claim=False, nonce=None):
             if r["tid"] == tid:
                 r["last_access"] = time.time()
                 if claim:
-                    r["claimed_by_pid"] = my_pid
+                    _write_claim(r, my_owner)
                 if nonce and not r.get("nonce"):
                     r["nonce"] = nonce
                 _save_state(state)
                 return
         rec = {"tid": tid, "last_access": time.time()}
         if claim:
-            rec["claimed_by_pid"] = my_pid
+            _write_claim(rec, my_owner)
         if nonce:
             rec["nonce"] = nonce
         tabs.append(rec)
@@ -236,11 +317,11 @@ def _record_access(tid, claim=False, nonce=None):
 
 
 def _gc_orphan_claims(state):
-    """Mutate state in place: drop claimed_by_pid for dead processes (mark orphan)."""
+    """Mutate state in place: drop claim for dead owners (mark orphan)."""
     for r in state.get("agent_tabs", []):
-        pid = r.get("claimed_by_pid")
-        if pid and not _pid_alive(pid):
-            r.pop("claimed_by_pid", None)
+        owner = _read_claim(r)
+        if owner and not _owner_alive(owner):
+            _clear_claim(r)
 
 
 # ---------- CDP attach helpers (no focus steal) ----------
@@ -653,7 +734,7 @@ def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
     state mutex was added). Without this, the cap silently leaked under
     concurrent fresh-mode load.
     """
-    my_pid = os.getpid()
+    my_owner = _get_owner_id()
     targets = cdp("Target.getTargets").get("targetInfos", [])
     live_tids = {t.get("targetId") for t in targets if t.get("type") == "page"}
 
@@ -662,8 +743,8 @@ def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
         _gc_orphan_claims(state)
         records = state.get("agent_tabs", [])
         live_records = [r for r in records if r["tid"] in live_tids]
-        not_mine = [r for r in live_records if r.get("claimed_by_pid") not in (my_pid, None)]
-        mine_or_orphan = [r for r in live_records if r.get("claimed_by_pid") in (my_pid, None)]
+        not_mine = [r for r in live_records if _read_claim(r) not in (my_owner, None)]
+        mine_or_orphan = [r for r in live_records if _read_claim(r) in (my_owner, None)]
         victims = []
         while len(mine_or_orphan) > max_n:
             mine_or_orphan.sort(key=lambda r: r["last_access"])
@@ -745,7 +826,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     # live and usable. Filtering by browser-wide live keeps reuse stable.
     all_targets = cdp("Target.getTargets").get("targetInfos", [])
     browser_live_tids = {t.get("targetId") for t in all_targets if t.get("type") == "page"}
-    my_pid = os.getpid()
+    my_owner = _get_owner_id()
 
     # Collect second_wid's tids for orphan adoption below. _list_windows() is
     # canonical for "what tabs are physically in second window".
@@ -757,15 +838,15 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     except Exception:
         pass
 
-    # Mutex around the read+claim so concurrent fresh PIDs don't both adopt the
-    # same orphan. Without the lock, two PIDs see the same orphan, both write
-    # claimed_by_pid=themself, last writer wins, the other process operates on
-    # a tab that no longer "belongs" to it — fights ensue when both navigate.
+    # Mutex around the read+claim so concurrent fresh callers don't both adopt
+    # the same orphan. Without the lock, two callers see the same orphan, both
+    # write claimed_by=themself, last writer wins, the other operates on a tab
+    # that no longer "belongs" to it — fights ensue when both navigate.
     with _state_mutex():
         state = _load_state()
         _gc_orphan_claims(state)  # release tabs whose owner died
         mine = [r for r in state.get("agent_tabs", [])
-                if r["tid"] in browser_live_tids and r.get("claimed_by_pid") == my_pid]
+                if r["tid"] in browser_live_tids and _read_claim(r) == my_owner]
         if mine:
             mine.sort(key=lambda r: r["last_access"], reverse=True)
             tid = mine[0]["tid"]
@@ -783,15 +864,15 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             # active:false isn't 100% silent under load, and chrome.exe
             # --new-window fallback is definitely loud). User reported
             # 2026-05-24: "屏幕直接跳到第二个窗口...一直在开 example.com" —
-            # consequence of every fresh PID spawning a fresh agent tab.
+            # consequence of every fresh caller spawning a fresh agent tab.
             #
-            # Eligibility: orphan = state record with claimed_by_pid in (None,)
-            # AND tid still alive in CDP AND tab is physically in second window
-            # (not in some random window — defense against pin drift).
+            # Eligibility: orphan = state record with no claim AND tid still
+            # alive in CDP AND tab is physically in second window (not in
+            # some random window — defense against pin drift).
             orphans = [
                 r for r in state.get("agent_tabs", [])
                 if r["tid"] in browser_live_tids
-                and r.get("claimed_by_pid") is None
+                and _read_claim(r) is None
                 and (not second_window_tids or r["tid"] in second_window_tids)
             ]
             if orphans:
@@ -801,7 +882,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
                 adopted_tid = orphans[0]["tid"]
                 for r in state["agent_tabs"]:
                     if r["tid"] == adopted_tid:
-                        r["claimed_by_pid"] = my_pid
+                        _write_claim(r, my_owner)
                         r["last_access"] = time.time()
                         break
                 _save_state(state)
@@ -896,10 +977,10 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
         all_targets = cdp("Target.getTargets").get("targetInfos", [])
         new_tids = [t.get("targetId") for t in all_targets
                     if t.get("type") == "page" and t.get("targetId") not in pre_tids]
-        # Filter out tabs already claimed by other live PIDs
+        # Filter out tabs already claimed by other live owners
         state_now = _load_state()
         other_claimed = {r["tid"] for r in state_now.get("agent_tabs", [])
-                         if r.get("claimed_by_pid") not in (None, my_pid)}
+                         if _read_claim(r) not in (None, my_owner)}
         new_unclaimed = [t for t in new_tids if t not in other_claimed]
         if len(new_unclaimed) == 1:
             tid = new_unclaimed[0]
