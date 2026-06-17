@@ -12,3 +12,4 @@ chrome-profile-bid/
 
 # soak test outputs
 tests/soak-1999/results/*.jsonl
+workspace/
