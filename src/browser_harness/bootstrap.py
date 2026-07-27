@@ -306,6 +306,9 @@ def safe_globals():
     def send_keys(keys):
         return _with_self_heal(lambda t: _sw.send_keys_agent(t, keys))
 
+    def hotkey(chord):
+        return _with_self_heal(lambda t: _sw.hotkey_agent(t, chord))
+
     def fill(selector, value):
         return _with_self_heal(lambda t: _sw.fill_agent(t, selector, value))
 
@@ -346,6 +349,7 @@ def safe_globals():
         "click_at": _wrap(click_at),
         "type_text": _wrap(type_text),
         "send_keys": _wrap(send_keys),
+        "hotkey": _wrap(hotkey),
         "fill": _wrap(fill),
         "upload": _wrap(upload),
         "close_tab": close_tab,

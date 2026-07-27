@@ -15,7 +15,8 @@ Key APIs:
     fill_agent(tid, selector, value)
     click_at_agent(tid, x, y)      # alias: mouse_click_agent
     key_type_agent(tid, text)
-    send_keys_agent(tid, [keys])
+    send_keys_agent(tid, [keys])   # independent key presses, NO held modifiers
+    hotkey_agent(tid, "Ctrl+End")  # real modifier chord (Ctrl/Shift/Alt/Meta)
     upload_agent(tid, selector, [file_paths])
     list_agent_tabs()
     find_agent_tab(url_substring)
@@ -1115,6 +1116,81 @@ def send_keys_agent(agent_tid, keys):
                     code=k, key=k, windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
                 cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
                     code=k, key=k, windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
+        _record_access(agent_tid)
+    finally:
+        _detach(sid)
+
+
+# CDP Input.dispatchKeyEvent modifiers bitmask.
+_CHORD_MODS = {
+    "alt": (1, 18, "AltLeft", "Alt"),
+    "ctrl": (2, 17, "ControlLeft", "Control"),
+    "control": (2, 17, "ControlLeft", "Control"),
+    "meta": (4, 91, "MetaLeft", "Meta"),
+    "cmd": (4, 91, "MetaLeft", "Meta"),
+    "command": (4, 91, "MetaLeft", "Meta"),
+    "win": (4, 91, "MetaLeft", "Meta"),
+    "shift": (8, 16, "ShiftLeft", "Shift"),
+}
+
+
+def _resolve_chord_key(tok):
+    """Map a final-key token to (windowsVirtualKeyCode, code, key) for CDP."""
+    if len(tok) == 1:
+        ch = tok.upper()
+        if "A" <= ch <= "Z":
+            return ord(ch), "Key" + ch, tok
+        if "0" <= ch <= "9":
+            return ord(ch), "Digit" + ch, tok
+        return 0, tok, tok  # punctuation: best-effort, let Chrome map by code
+    vk = _VK_MAP.get(tok, 0)
+    return vk, tok, tok
+
+
+def hotkey_agent(agent_tid, chord):
+    """Press a modifier chord like "Control+End", "Ctrl+A", "Shift+ArrowRight".
+
+    Holds each modifier down (carrying the cumulative CDP modifier bitmask),
+    presses the final key with that bitmask active, then releases everything in
+    reverse. Unlike send_keys_agent (which iterates tokens independently and has
+    no concept of held modifiers), this produces a real shortcut chord.
+    """
+    parts = [p.strip() for p in chord.split("+") if p.strip()]
+    if not parts:
+        return
+    *mod_names, final = parts
+    mods = []  # (bit, vk, code, key)
+    for name in mod_names:
+        m = _CHORD_MODS.get(name.lower())
+        if m is None:
+            raise ValueError(f"unknown modifier {name!r} in chord {chord!r}")
+        mods.append(m)
+    mask = 0
+    for bit, *_ in mods:
+        mask |= bit
+    fvk, fcode, fkey = _resolve_chord_key(final)
+
+    sid = _attach(agent_tid)
+    try:
+        held = 0
+        for bit, vk, code, key in mods:
+            held |= bit
+            cdp("Input.dispatchKeyEvent", session_id=sid, type="rawKeyDown",
+                code=code, key=key, windowsVirtualKeyCode=vk,
+                nativeVirtualKeyCode=vk, modifiers=held)
+        # Final key. No `text` is sent: with a non-shift modifier held that would
+        # emit a control char instead of triggering the shortcut.
+        cdp("Input.dispatchKeyEvent", session_id=sid, type="rawKeyDown",
+            code=fcode, key=fkey, windowsVirtualKeyCode=fvk,
+            nativeVirtualKeyCode=fvk, modifiers=mask)
+        cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
+            code=fcode, key=fkey, windowsVirtualKeyCode=fvk,
+            nativeVirtualKeyCode=fvk, modifiers=mask)
+        for bit, vk, code, key in reversed(mods):
+            held &= ~bit
+            cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
+                code=code, key=key, windowsVirtualKeyCode=vk,
+                nativeVirtualKeyCode=vk, modifiers=held)
         _record_access(agent_tid)
     finally:
         _detach(sid)

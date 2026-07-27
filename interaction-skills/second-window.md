@@ -15,7 +15,7 @@ Chrome window, route all agent operations through their second window.
 from browser_harness.second_window import (
     ensure_agent_tab, navigate_agent, snapshot_agent, screenshot_agent,
     save_as_pdf_agent, evaluate_agent, fill_agent, click_at_agent,
-    key_type_agent, send_keys_agent, upload_agent,
+    key_type_agent, send_keys_agent, hotkey_agent, upload_agent,
     list_agent_tabs, find_agent_tab, close_agent_tab,
 )
 
@@ -28,7 +28,30 @@ screenshot_agent(tid, "/tmp/shot.png")
 save_as_pdf_agent(tid, "/tmp/page.pdf")
 fill_agent(tid, 'input[name="q"]', "search term")
 send_keys_agent(tid, ["Enter"])
+hotkey_agent(tid, "Ctrl+End")     # modifier chords: jump to doc end, select all, etc.
 ```
+
+### send_keys vs hotkey (important)
+
+`send_keys_agent(tid, [...])` presses each token **independently** with no held
+modifiers. `send_keys_agent(tid, "Control+End")` does NOT do Ctrl+End — it types
+the literal characters `Control+End` into the page. Use it only for standalone
+keys like `["Enter"]`, `["Tab"]`, `["ArrowDown"]`.
+
+For real keyboard shortcuts use `hotkey_agent(tid, chord)`, which holds the
+modifier(s) down while pressing the final key:
+
+```python
+hotkey_agent(tid, "Ctrl+End")        # caret to end of document
+hotkey_agent(tid, "Ctrl+A")          # select all
+hotkey_agent(tid, "Shift+ArrowRight")# extend selection
+hotkey_agent(tid, "Ctrl+Shift+End")  # multi-modifier chords work too
+```
+
+Modifiers: `Ctrl`/`Control`, `Shift`, `Alt`, `Meta`/`Cmd`/`Win`. The final key is
+either a single char (`a`, `1`) or a named key from the `_VK_MAP`
+(`End`, `Home`, `ArrowRight`, `Enter`, ...). This is the right tool for
+canvas-rendered editors (Google Docs, Sheets) where DOM editing is impossible.
 
 ## How it works
 
@@ -60,7 +83,8 @@ process restart.
 | mouse_click | `click_at_agent` |
 | fill | `fill_agent` |
 | key_type | `key_type_agent` |
-| send_keys | `send_keys_agent` |
+| send_keys | `send_keys_agent` (independent keys, no held modifiers) |
+| (chord) | `hotkey_agent` (real Ctrl/Shift/Alt/Meta shortcuts) |
 | screenshot | `screenshot_agent` |
 | save_as_pdf | `save_as_pdf_agent` |
 | upload | `upload_agent` |
