@@ -113,10 +113,15 @@ def spawn_agent_tab_in_window(window_id, url=None):
     if not is_available():
         return None, None
     import os, time as _time, uuid as _uuid
-    from .second_window import AGENT_SPAWN_URL
+    from .second_window import AGENT_SPAWN_URL, _get_owner_id
     base_url = (url or AGENT_SPAWN_URL).split("#")[0]
-    # Append unique nonce so concurrent calls don't collide on URL match
-    nonce = f"bh-nonce={os.getpid()}-{int(_time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
+    # Append unique nonce so concurrent calls don't collide on URL match.
+    # Prefix is the owner id (sanitised: "session:<uuid>" / "pid:<n>" → '-')
+    # rather than a bare pid, so a leaked placeholder in the URL bar names the
+    # session that leaked it, matching the CDP-fallback path in second_window.
+    # Uniqueness comes from the uuid4 suffix regardless.
+    _owner = _get_owner_id().replace(":", "-")
+    nonce = f"bh-nonce={_owner}-{int(_time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
     sep = "&" if "?" in base_url else "?"
     target_url = f"{base_url}{sep}{nonce}"
     result = send_command("create_tab",

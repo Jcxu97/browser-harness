@@ -142,11 +142,15 @@ def _close_placeholder_tabs():
     (test scenario I05). Per-tab nonce match is exact and immune to URL
     spoofing.
 
-    PID-SCOPED: we only close tabs claimed by os.getpid() in the state file.
-    Concurrent BH sessions (main thread + sub-agent in parallel) each clean up
-    only their own placeholders; we never close another session's tab — see
+    SESSION-SCOPED: we only close tabs claimed by our own owner id in the state
+    file. Concurrent BH sessions (main thread + sub-agent in parallel) each clean
+    up only their own placeholders; we never close another session's tab — see
     `reference_browser_session_isolation` in user memory for why this matters
     (the 2026-05-20 doubao-vs-Nexus tab-poaching incident).
+
+    Scoping is by session, NOT by pid: every `browser-harness <<'PY'` heredoc is
+    a fresh short-lived process, so a pid-scoped claim never matches on the next
+    call (that's why c867cf5 moved to `_get_owner_id()`).
 
     Tabs the agent navigated to a real URL are LEFT ALONE — they may be useful
     for the next session to reuse, and the user may want to see their final
@@ -159,12 +163,17 @@ def _close_placeholder_tabs():
         return
     try:
         import time as _time
-        my_pid = os.getpid()
+        # Must go through _read_claim/_get_owner_id, not r["claimed_by_pid"]:
+        # c867cf5 switched _write_claim to store `claimed_by` (session id) and
+        # actively pops `claimed_by_pid`, so the old int comparison matched zero
+        # records and this whole cleanup silently no-op'd — leaving the tab cap
+        # as the only GC, which the cap comment explicitly says it shouldn't be.
+        my_owner = _sw._get_owner_id()
         state = _sw._load_state()
         my_records = {
             r["tid"]: r.get("nonce")
             for r in state.get("agent_tabs", [])
-            if r.get("claimed_by_pid") == my_pid and r.get("tid")
+            if _sw._read_claim(r) == my_owner and r.get("tid")
         }
         if not my_records:
             return

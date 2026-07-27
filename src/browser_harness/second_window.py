@@ -937,7 +937,14 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     # (yanked user's active tab to tab #0). Replaced with smart-focus that
     # activates the ALREADY-active tab — raises window without changing tab.
     import uuid as _uuid
-    nonce = f"{my_pid}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
+    # Prefix with the owner id (sanitised — it's "session:<uuid>" or "pid:<n>",
+    # and ':' would muddy the substring scan below) so a stray placeholder in
+    # the URL bar can be traced back to which session leaked it. Uniqueness
+    # comes from the uuid4 suffix, not the prefix.
+    # NOTE: was `my_pid` until 2026-07-27 — that name never existed in this
+    # function after c867cf5 renamed it to my_owner, so this line raised
+    # NameError on every CDP-fallback spawn (extension path never hit it).
+    nonce = f"{my_owner.replace(':', '-')}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
     spawn_url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
     seed_tid = tabs[0][0]
     # Capture browser-wide tids BEFORE the spawn so we can identify the
