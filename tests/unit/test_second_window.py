@@ -10,12 +10,19 @@ to survive the USER_DOMAINS guard — a blocklist that is never complete — and
 tab landed in the user's main window (tabs were m365 + a Tailscale-addressed
 sub2api panel, neither of which was listed at the time).
 """
+import contextlib
 import sys
 import types
 
 import pytest
 
 from browser_harness import second_window as sw
+
+
+@contextlib.contextmanager
+def _null_mutex(*a, **k):
+    """Stand-in for _state_mutex: these tests are single-process."""
+    yield
 
 MAIN, SECOND = 111, 222
 
@@ -115,3 +122,86 @@ def test_dead_pin_is_dropped_without_falling_back_to_main(detect):
 def test_user_surfaces_are_recognised(url):
     """The sub2api panel is the user's, over loopback AND over Tailscale."""
     assert sw._count_user_hits([url]) > 0, f"{url} not recognised as user content"
+
+
+# ---------- _assert_landed_in: the one check that does not rely on guessing ----------
+
+@pytest.fixture
+def fake_cdp(monkeypatch):
+    """Stub cdp() and record every call, so we can assert on cleanup."""
+    calls = []
+
+    def _install(window_for_target, closes_ok=True):
+        def fake(method, **kw):
+            calls.append((method, kw))
+            if method == "Browser.getWindowForTarget":
+                if isinstance(window_for_target, Exception):
+                    raise window_for_target
+                return {"windowId": window_for_target}
+            if method == "Target.closeTarget":
+                if not closes_ok:
+                    raise RuntimeError("close failed")
+                return {}
+            return {}
+        monkeypatch.setattr(sw, "cdp", fake)
+        return calls
+
+    return _install
+
+
+def test_assert_landed_in_accepts_correct_window(fake_cdp):
+    calls = fake_cdp(window_for_target=SECOND)
+    sw._assert_landed_in("tid-1", SECOND)
+    assert not [c for c in calls if c[0] == "Target.closeTarget"], \
+        "must not close a tab that landed correctly"
+
+
+def test_assert_landed_in_closes_and_raises_on_wrong_window(fake_cdp):
+    """A tab in the user's window must be closed, not merely reported."""
+    calls = fake_cdp(window_for_target=MAIN)
+    with pytest.raises(RuntimeError, match="landed in window"):
+        sw._assert_landed_in("tid-stray", SECOND)
+    closed = [kw["targetId"] for m, kw in calls if m == "Target.closeTarget"]
+    assert closed == ["tid-stray"], "stray tab left behind in the user's window"
+
+
+def test_assert_landed_in_treats_unverifiable_as_failure(fake_cdp):
+    """If Chrome won't say where the tab is, assume the worst and clean up."""
+    calls = fake_cdp(window_for_target=RuntimeError("cdp down"))
+    with pytest.raises(RuntimeError, match="cannot confirm"):
+        sw._assert_landed_in("tid-unknown", SECOND)
+    assert [kw["targetId"] for m, kw in calls if m == "Target.closeTarget"] == ["tid-unknown"]
+
+
+def test_assert_landed_in_still_raises_when_cleanup_fails(fake_cdp):
+    fake_cdp(window_for_target=MAIN, closes_ok=False)
+    with pytest.raises(RuntimeError, match="landed in window"):
+        sw._assert_landed_in("tid-stray", SECOND)
+
+
+# ---------- prune_agent_tabs must never close the user's tabs ----------
+
+def test_prune_only_reaps_tabs_carrying_our_marker(monkeypatch):
+    """The second window may double as a window the user works in.
+
+    Regression: prune used to treat "in the pinned window, not in state, not
+    about:blank" as reapable — i.e. exactly the user's own tabs. With more than
+    max_n of them open it silently closed the overflow.
+    """
+    pinned = SECOND
+    user_tabs = [(f"user-{i}", f"https://news.example.com/{i}", "news") for i in range(6)]
+    ours = [("ours-1", f"https://example.com/?{sw.AGENT_TAB_MARKER}=1&bh-nonce=x", "")]
+    monkeypatch.setattr(sw, "_list_windows", lambda: {pinned: user_tabs + ours})
+    monkeypatch.setattr(sw, "_load_state",
+                        lambda: {"pinned_second_window_id": pinned, "agent_tabs": []})
+    monkeypatch.setattr(sw, "_save_state", lambda s: None)
+    monkeypatch.setattr(sw, "_state_mutex", _null_mutex)
+
+    closed = []
+    monkeypatch.setattr(sw, "cdp", lambda method, **kw: (
+        closed.append(kw.get("targetId")) if method == "Target.closeTarget" else None) or {})
+
+    sw.prune_agent_tabs(max_n=2)  # 7 tabs vs cap 2 → old code would close 5
+
+    assert all(t.startswith("ours-") for t in closed), \
+        f"prune closed the user's tabs: {[t for t in closed if not t.startswith('ours-')]}"

@@ -784,10 +784,22 @@ def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
             windows = _list_windows()
             if pinned in windows:
                 known_tids = {r["tid"] for r in state.get("agent_tabs", []) if r.get("tid")}
-                # Don't touch known tabs OR our spawn placeholder URL during the same cleanup pass.
+                # Only ever reap tabs that carry OUR spawn marker.
+                #
+                # 2026-07-30: this used to reap any tab in the pinned window that
+                # wasn't in state and wasn't about:blank — which is the definition
+                # of "a tab the user opened themselves". The second window is
+                # explicitly allowed to be a window the user also works in, so
+                # with >max_n of their own tabs open, a prune pass would silently
+                # close (count - max_n) of them, `except Exception: pass` and all.
+                # Upstream 2e89e13 calls this out as "don't touch tabs we didn't
+                # open"; requiring AGENT_TAB_MARKER makes that structural rather
+                # than a guess. Tabs we spawned and then navigated to a real URL
+                # lose the marker, but those are in `state` and get GC'd through
+                # the claim path instead.
                 cdp_orphans = [
                     (tid, url) for (tid, url, _title) in windows[pinned]
-                    if tid not in known_tids and url not in ("about:blank",)
+                    if tid not in known_tids and AGENT_TAB_MARKER in (url or "")
                 ]
                 # Be conservative: only close if window is over the cap. Below cap, leave them.
                 excess = len(windows[pinned]) - max_n
@@ -805,6 +817,49 @@ def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
 
 
 # ---------- core: ensure agent tab ----------
+
+def _assert_landed_in(tid, expected_wid):
+    """Fail loudly if a freshly spawned tab did NOT land in the second window.
+
+    This is the last line of defence for the whole fork, and the only one that
+    does not depend on guessing. Everything upstream of it is inference:
+    detect_second_window() reads a heuristic, USER_DOMAINS is a blocklist that is
+    never complete, the extension can be asleep, and a persisted pin can outlive
+    the window it named. Any of those being wrong used to mean a tab silently
+    appeared in the window the user is looking at (2026-05-20 and 2026-07-30 both
+    happened that way). Asking Chrome where the tab actually is turns every one of
+    those misjudgements into an exception instead.
+
+    Copied from image_gen/copilot.py, which had this check while the main entry
+    point did not.
+
+    On mismatch the stray tab is closed before raising — leaving it behind would
+    be exactly the pollution we are trying to prevent.
+    """
+    try:
+        actual = cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
+    except Exception as e:
+        # Cannot verify. Treat as failure rather than assuming success: an
+        # unverifiable spawn is how tabs end up in the user's window.
+        try:
+            cdp("Target.closeTarget", targetId=tid)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"agent tab {tid}: cannot confirm which window it landed in ({e}); "
+            "closed it rather than risk operating on the user's window"
+        )
+    if actual != expected_wid:
+        try:
+            cdp("Target.closeTarget", targetId=tid)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"agent tab landed in window {actual}, expected second window "
+            f"{expected_wid} — closed it. The second-window detection was wrong; "
+            "pin the correct window with second_window.pin_second_window(wid)."
+        )
+
 
 def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
     """
@@ -934,6 +989,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             if ext.is_available():
                 tid, nonce = ext.spawn_agent_tab_in_window(second_wid)
                 if tid:
+                    _assert_landed_in(tid, second_wid)
                     _record_access(tid, claim=True, nonce=nonce)
                     prune_agent_tabs(max_n=max_tabs)
                     _smart_focus_main_window(main_snapshot)
@@ -1007,6 +1063,10 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
             tid = new_unclaimed[0]
     if not tid:
         raise RuntimeError("Failed to spawn agent tab — neither nonce nor new-target diff resolved (popup blocker?)")
+    # window.open() always opens in the OPENER's window, so if `tabs[0]` above
+    # belonged to the user's main window, this tab is now sitting in front of
+    # them. Verify before claiming it.
+    _assert_landed_in(tid, second_wid)
     _record_access(tid, claim=True, nonce=nonce)
     prune_agent_tabs(max_n=max_tabs)
     _smart_focus_main_window(main_snapshot)
