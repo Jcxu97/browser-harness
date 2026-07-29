@@ -58,6 +58,12 @@ USER_DOMAINS = (
     # User's daily-use admin/management surfaces (user told 2026-05-21):
     "127.0.0.1:8090/admin",  # sub2api admin panel — user opens it on main browser
     "localhost:8090/admin",
+    # Same panel over Tailscale — this is the form the user actually opens
+    # (2026-07-30: only the loopback forms were listed, so a detect pass scored
+    # the main window as non-user and a tab got inserted there. The whole
+    # 100.64.0.0/10 CGNAT range is private infrastructure, never agent work.)
+    ":8090/admin",
+    "100.86.104.62",
 )
 WORK_DOMAINS = (
     "nexusmods.com", "doubao.com/chat", "m365.cloud.microsoft",
@@ -574,7 +580,14 @@ def detect_second_window():
     candidates = [(wid, tabs) for wid, tabs in cdp_windows.items()
                   if wid != main_wid_from_ext]
     if not candidates:
-        candidates = list(cdp_windows.items())
+        # Defensive only — unreachable today: the `len(cdp_windows) < 2` early
+        # return above guarantees >=2 windows, and we exclude at most one, so
+        # something always survives. Kept because the old body here was
+        # `candidates = list(cdp_windows.items())`, which would have put the
+        # extension-identified main window back into contention; if the early
+        # return above is ever relaxed, that must not silently come back.
+        # Declining is correct: the caller spawns a fresh window.
+        return None, None
 
     # 3. Domain-content scoring + user-domain exclusion (HARD GUARD).
     # Tie-breaker: smaller windowId = older window = more likely user's main
