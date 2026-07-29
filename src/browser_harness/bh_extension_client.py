@@ -6,7 +6,7 @@ Public API:
     is_available()                       # extension connected?
     start_server_if_needed()             # spawn server daemon
     send_command(action, **params)       # generic RPC
-    ensure_agent_tab_via_extension()     # zero-focus-steal agent tab spawn
+    spawn_agent_tab_in_window(wid)       # spawn into an ALREADY-VETTED window
 """
 
 import http.client
@@ -152,24 +152,15 @@ def spawn_agent_tab_in_window(window_id, url=None):
 
 
 # Back-compat alias (older code may still import this name).
-def ensure_agent_tab_via_extension():
-    """DEPRECATED — use spawn_agent_tab_in_window after second-window detection."""
-    if not start_server_if_needed() or not is_available():
-        return None
-    ext_windows = send_command("list_windows", timeout=5)
-    if not ext_windows or len(ext_windows) < 2:
-        return None
-    real = []
-    for w in ext_windows:
-        tabs = [t for t in w.get("tabs", [])
-                if not (t.get("url", "") or "").startswith(("chrome://", "chrome-extension://", "devtools://"))]
-        if tabs:
-            real.append((w["id"], tabs))
-    if len(real) < 2:
-        return None
-    real.sort(key=lambda kv: len(kv[1]))
-    tid, _nonce = spawn_agent_tab_in_window(real[0][0])
-    return tid
+# REMOVED 2026-07-30: ensure_agent_tab_via_extension()
+#
+# It picked the window with the FEWEST tabs and spawned there, with no
+# USER_DOMAINS check — the exact heuristic that put agent tabs into the user's
+# main window on 2026-05-20 (their main window was the tidy one). It had no
+# callers, so it survived only as a trap for whoever called it next.
+#
+# Correct path: second_window.ensure_agent_tab(), which runs detection, the
+# user-content guard, and _assert_landed_in() afterwards.
 
 
 def stop_server():

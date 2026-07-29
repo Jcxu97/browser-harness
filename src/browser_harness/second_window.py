@@ -21,10 +21,10 @@ Key APIs:
     list_agent_tabs()
     find_agent_tab(url_substring)
     close_agent_tab(tid)
-    prune_agent_tabs(max_n=25)
+    prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS)   # 15; backstop, not primary GC
 
 Internal:
-    detect_second_window()         # heuristic: window with fewest tabs
+    detect_second_window()         # pin > extension focused flag > content scoring
     spawn_second_window()          # chrome.exe --new-window (steals focus once)
 
 Optional acceleration: if `bh_extension_client.is_available()` is True (the
@@ -344,26 +344,17 @@ def _detach(sid):
 
 # ---------- focus-steal mitigation ----------
 
-def _detect_main_window():
-    """User's main (foreground-focused) window. Prefer extension's `focused`
-    field (authoritative); fall back to tab-count heuristic when extension is
-    unavailable (the heuristic is wrong when second window has more tabs than
-    main, e.g. heavy NexusMods workflow — see 2026-05-20 user incident)."""
-    try:
-        from . import bh_extension_client as ext
-        ext.start_server_if_needed()
-        if ext.is_available():
-            wins = ext.send_command("list_windows", timeout=3)
-            if wins:
-                focused = [w for w in wins if w.get("focused")]
-                if focused:
-                    return focused[0]["id"]
-    except Exception:
-        pass
-    windows = _list_windows()
-    if not windows:
-        return None
-    return max(windows.items(), key=lambda kv: len(kv[1]))[0]
+# REMOVED 2026-07-30: _detect_main_window()
+#
+# No callers. Its fallback was `max(windows, key=tab_count)` — the tab-count
+# heuristic whose own docstring admitted it is wrong when the second window has
+# more tabs than the main one, which is precisely the 2026-05-20 incident.
+# detect_second_window() below already declares that heuristic dead; leaving a
+# live copy of it in the file only invited someone to reach for it.
+#
+# For "which window is the user's", use the extension's focused flag
+# (_capture_user_main_window) and treat unavailability as a hard stop, not as
+# licence to guess.
 
 
 def _capture_user_main_window():
@@ -668,10 +659,30 @@ def spawn_second_window(timeout=10):
                 timeout=8,
             )
             if res and res.get("ok"):
-                # Re-discover via CDP since extension's chrome window id != CDP windowId
+                # Use the windowId the extension just handed us (background.js
+                # returns it from chrome.windows.create).
+                #
+                # The old comment here claimed "extension's chrome window id !=
+                # CDP windowId" and threw the value away in favour of
+                # _detect_minimized_blank_window(), which scans for "the one
+                # minimized about:blank window". That guess picks the WRONG
+                # window whenever the user happens to have a blank window open,
+                # and the window we really created then leaks — never used,
+                # never closed.
+                #
+                # Measured 2026-07-30: the two id spaces are identical. Extension
+                # reported [1976814855, 1976815412]; CDP reported the same pair,
+                # and cross-checking a tab from each window through
+                # Browser.getWindowForTarget returned the matching id. (Consistent
+                # with the rest of this file, which already compares extension
+                # ids against CDP window ids on the safety-critical path in
+                # detect_second_window.)
+                ext_wid = res.get("windowId")
                 deadline = time.time() + timeout
                 while time.time() < deadline:
-                    wid = _detect_minimized_blank_window()
+                    live = _list_windows()
+                    # Trust the reported id once CDP can see that window too.
+                    wid = ext_wid if ext_wid in live else _detect_minimized_blank_window()
                     if wid is not None:
                         # Extension path is silent but call smart-focus anyway —
                         # it's a cheap activateTarget on an already-active tab,
