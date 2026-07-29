@@ -26,6 +26,13 @@ def _null_mutex(*a, **k):
     """Stand-in for _state_mutex: these tests are single-process."""
     yield
 
+
+@pytest.fixture(autouse=True)
+def _clean_snapshot_flag(monkeypatch):
+    """_LAST_LIST_DROPPED is module state; keep tests from leaking it into each
+    other. Default is 0 = complete snapshot."""
+    monkeypatch.setattr(sw, "_LAST_LIST_DROPPED", 0)
+
 MAIN, SECOND = 111, 222
 
 USER_TABS = [("t1", "https://www.huya.com/l"), ("t2", "https://www.bilibili.com/")]
@@ -280,3 +287,79 @@ def test_pid_alive_says_alive_when_it_cannot_tell(monkeypatch):
     monkeypatch.setattr(ctypes, "windll",
                         types.SimpleNamespace(kernel32=FakeK32()))
     assert sw._pid_alive(4) is True, "access-denied must not read as dead"
+
+
+# ---------- fail-closed on incomplete data ----------
+
+def test_detect_refuses_to_score_an_incomplete_snapshot(detect, monkeypatch):
+    """One CDP hiccup must not walk past the blocklist.
+
+    _list_windows drops tabs whose window it can't resolve. If the dropped tab
+    was the bilibili one, the user's main window scores as user-content-free and
+    becomes an eligible candidate. So a partial snapshot disqualifies scoring.
+    """
+    monkeypatch.setattr(sw, "_LAST_LIST_DROPPED", 2)
+    assert detect({MAIN: USER_TABS, SECOND: CLEAN_TABS}, ext_focused=MAIN) == (None, None)
+
+
+def test_list_windows_reports_dropped_tabs(monkeypatch):
+    def fake_cdp(method, **kw):
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"type": "page", "targetId": "ok", "url": "https://a.example", "title": ""},
+                {"type": "page", "targetId": "bad", "url": "https://b.example", "title": ""},
+            ]}
+        if method == "Browser.getWindowForTarget":
+            if kw["targetId"] == "bad":
+                raise RuntimeError("cannot resolve")
+            return {"windowId": SECOND}
+        return {}
+
+    monkeypatch.setattr(sw, "cdp", fake_cdp)
+    windows = sw._list_windows()
+    assert windows == {SECOND: [("ok", "https://a.example", "")]}
+    assert sw._LAST_LIST_DROPPED == 1, "unplaceable tab not reported"
+
+
+def test_orphan_in_unknown_window_is_not_adopted(monkeypatch):
+    """`second_window_tids is None` means "couldn't check", not "empty window".
+
+    Behavioural check: an unclaimed record whose tab is live but whose window
+    membership cannot be established must NOT be adopted. The old guard
+    (`not second_window_tids or tid in second_window_tids`) evaporated in exactly
+    that case, degrading into "adopt an orphan from any window" — the user's
+    included. Here _list_windows raises, so membership is unknowable; the orphan
+    must be passed over and a fresh spawn attempted instead.
+    """
+    orphan_tid = "orphan-1"
+    state = {"pinned_second_window_id": SECOND,
+             "agent_tabs": [{"tid": orphan_tid, "nonce": "n"}]}  # no claim → orphan
+
+    monkeypatch.setattr(sw, "detect_second_window", lambda: (SECOND, CLEAN_TABS))
+    monkeypatch.setattr(sw, "_load_state", lambda: state)
+    monkeypatch.setattr(sw, "_save_state", lambda s: None)
+    monkeypatch.setattr(sw, "_state_mutex", _null_mutex)
+    monkeypatch.setattr(sw, "_capture_user_main_window", lambda: None)
+    monkeypatch.setattr(sw, "_smart_focus_main_window", lambda snap: None)
+    monkeypatch.setattr(sw, "prune_agent_tabs", lambda **k: 0)
+    monkeypatch.setattr(sw, "_gc_orphan_claims", lambda *a, **k: None)
+
+    def boom():
+        raise RuntimeError("cannot list windows")
+    monkeypatch.setattr(sw, "_list_windows", boom)
+
+    # The orphan's tab is live, so only the membership guard can rule it out.
+    def fake_cdp(method, **kw):
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"type": "page", "targetId": orphan_tid,
+                                     "url": "https://example.com/?bh-agent-tab=1"}]}
+        raise RuntimeError("spawn path not exercised in this test")
+    monkeypatch.setattr(sw, "cdp", fake_cdp)
+
+    # Must not return the orphan. Any other outcome (exception from the spawn
+    # path we deliberately broke) is acceptable — the point is it wasn't adopted.
+    try:
+        got = sw.ensure_agent_tab(prefer_extension=False)
+    except Exception:
+        got = None
+    assert got != orphan_tid, "adopted an orphan whose window membership was unknown"

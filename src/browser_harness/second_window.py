@@ -531,10 +531,21 @@ def _smart_focus_main_window(snapshot):
 
 # ---------- window/tab discovery ----------
 
+# Tabs the last _list_windows() call could not assign to a window. Non-zero means
+# that snapshot was incomplete and must not be used for content scoring. Module
+# level rather than an attribute on the function so that patching or wrapping
+# _list_windows cannot silently drop the signal.
+_LAST_LIST_DROPPED = 0
+
+
 def _list_windows():
-    """{windowId: [(tid, url, title), ...]} for all real page tabs."""
+    """{windowId: [(tid, url, title), ...]} for all real page tabs.
+
+    Also updates the module-level `_LAST_LIST_DROPPED` counter; see above.
+    """
     targets = cdp("Target.getTargets").get("targetInfos", [])
     by_window = defaultdict(list)
+    dropped = 0
     for t in targets:
         if t.get("type") != "page": continue
         url = t.get("url", "")
@@ -545,7 +556,18 @@ def _list_windows():
             wid = cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
             by_window[wid].append((tid, url, t.get("title", "")))
         except Exception:
-            pass
+            # A tab we cannot place is a tab missing from every window's list.
+            # That matters because detect_second_window scores windows by their
+            # contents: if the dropped tab was the bilibili one, the user's main
+            # window suddenly looks user-content-free and becomes an eligible
+            # candidate — one CDP hiccup walking straight past the blocklist.
+            #
+            # We cannot know which window it belonged to (that lookup is exactly
+            # what failed), so the only sound response is to flag the snapshot as
+            # incomplete and let content-scoring callers refuse to act on it.
+            dropped += 1
+    global _LAST_LIST_DROPPED
+    _LAST_LIST_DROPPED = dropped
     return dict(by_window)
 
 
@@ -663,6 +685,13 @@ def detect_second_window():
         if _count_user_hits(urls) > 0:
             return (-10**6, _count_work_hits(urls), wid)
         return (0, _count_work_hits(urls), wid)
+
+    # Content scoring is only as good as the snapshot. If _list_windows had to
+    # drop tabs it couldn't place, a user-domain tab may be missing from the very
+    # window we're about to clear — refuse rather than score on partial data.
+    # The caller spawns a clean window, which is always safe.
+    if _LAST_LIST_DROPPED:
+        return None, None
 
     ranked = sorted(candidates, key=score, reverse=True)
     chosen_wid, chosen_tabs = ranked[0]
@@ -981,7 +1010,13 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
 
     # Collect second_wid's tids for orphan adoption below. _list_windows() is
     # canonical for "what tabs are physically in second window".
-    second_window_tids = set()
+    #
+    # None means "we could not determine this", which is NOT the same as "the
+    # second window has no tabs". The adoption guard below distinguishes them:
+    # an empty set legitimately blocks all adoption, whereas None used to make
+    # the guard vanish entirely (`not second_window_tids or ...`), degrading it
+    # into "adopt an orphan from any window at all" — including the user's.
+    second_window_tids = None
     try:
         cdp_windows = _list_windows()
         if second_wid in cdp_windows:
@@ -1024,7 +1059,11 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
                 r for r in state.get("agent_tabs", [])
                 if r["tid"] in browser_live_tids
                 and _read_claim(r) is None
-                and (not second_window_tids or r["tid"] in second_window_tids)
+                # fail-CLOSED: unknown membership (None) blocks adoption. Losing
+                # a reusable tab just costs one spawn; adopting a tab that turned
+                # out to be in the user's window costs their attention.
+                and second_window_tids is not None
+                and r["tid"] in second_window_tids
             ]
             if orphans:
                 # Adopt the most-recently-touched orphan: more likely already on
