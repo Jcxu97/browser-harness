@@ -170,7 +170,17 @@ def _state_mutex(timeout=15.0):
                 age = 0  # released — retry immediately
                 time.sleep(0.005)
                 continue
-            if age > 30:
+            # Only steal a lock whose holder is provably gone.
+            #
+            # 2026-07-30: this used to reap on age alone. The pid was written
+            # into the file but never read back, so a holder that was merely
+            # SLOW (cold home-directory IO, suspended process, resume from
+            # sleep) got its lock yanked while still inside the critical
+            # section — mutual exclusion silently off. _gc_orphan_claims can
+            # legitimately run tens of seconds: it calls _owner_alive per
+            # record, and each of those may walk ~/.claude/projects and hit
+            # OpenProcess.
+            if age > 30 and not _lock_holder_alive(_STATE_LOCK_PATH):
                 try: _STATE_LOCK_PATH.unlink()
                 except FileNotFoundError: pass
                 continue  # retry the create
@@ -180,12 +190,26 @@ def _state_mutex(timeout=15.0):
     try:
         yield
     finally:
-        try: _STATE_LOCK_PATH.unlink()
-        except FileNotFoundError: pass
+        # Release only if the file still carries OUR pid. An unconditional
+        # unlink would delete a lock that a reaper already reassigned to
+        # another process, letting a third one in while the second is still
+        # inside its critical section.
+        _release_lock_if_mine(_STATE_LOCK_PATH)
 
 
 def _pid_alive(pid):
-    """Check if a PID is still running. Returns True on uncertainty (be conservative)."""
+    """Is this PID still running? Returns True when we cannot tell.
+
+    Being wrong in the "it's dead" direction is the expensive one: callers use
+    this to decide whether to steal a lock or reclaim another session's tab, so
+    a false "dead" means breaking a live session. A false "alive" only costs a
+    wait or a leaked record.
+
+    2026-07-30: the docstring already promised conservative-on-uncertainty but
+    every failure path returned False, including OpenProcess denials — a live
+    process running at a different integrity level or under another user reads
+    as dead. Now only an explicit "no such process" answer counts as dead.
+    """
     if not pid:
         return False
     try:
@@ -194,20 +218,32 @@ def _pid_alive(pid):
             import ctypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             STILL_ACTIVE = 259
+            ERROR_INVALID_PARAMETER = 87  # what OpenProcess reports for a dead pid
+            ctypes.windll.kernel32.SetLastError(0)
             h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
-                return False
+                # ERROR_INVALID_PARAMETER == the pid genuinely doesn't exist.
+                # ERROR_ACCESS_DENIED (5) and friends mean it DOES exist but we
+                # may not look at it, so treat those as alive.
+                return ctypes.windll.kernel32.GetLastError() != ERROR_INVALID_PARAMETER
             try:
                 code = ctypes.c_ulong()
                 ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-                return bool(ok) and code.value == STILL_ACTIVE
+                if not ok:
+                    return True  # can't read exit code — assume alive
+                return code.value == STILL_ACTIVE
             finally:
                 ctypes.windll.kernel32.CloseHandle(h)
         else:
-            os.kill(pid, 0)
-            return True
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists, owned by someone else
     except Exception:
-        return False
+        return True  # unknown → conservative
 
 
 # ---------- owner identity (per-Claude-session, not per-PID) ----------
@@ -216,6 +252,41 @@ def _pid_alive(pid):
 # session is a fresh short-lived process. Per-PID claims die with the
 # heredoc, so the "orphan adoption" path lets the NEXT heredoc — which can
 # belong to a *different* Claude session — grab the previous tab. That's
+def _lock_pid(lock_path):
+    """PID recorded in a lock file, or None if unreadable/malformed."""
+    try:
+        first = lock_path.read_text(encoding="utf-8").splitlines()[0].strip()
+        return int(first)
+    except Exception:
+        return None
+
+
+def _lock_holder_alive(lock_path):
+    """Is the process that wrote this lock file still running?
+
+    Unreadable or malformed lock file → True (don't steal what we can't verify;
+    the age check already gates this, and a genuinely abandoned unreadable lock
+    is the rarer failure than a live holder we misread).
+    """
+    pid = _lock_pid(lock_path)
+    if pid is None:
+        return True
+    return _pid_alive(pid)
+
+
+def _release_lock_if_mine(lock_path):
+    """Delete a lock file only when it still records our own PID."""
+    pid = _lock_pid(lock_path)
+    if pid is not None and pid != os.getpid():
+        return  # a reaper handed it to someone else; leave theirs alone
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 # exactly the cross-session hijack we hit 2026-05-24 (Nexus upload tab kept
 # getting navigated to baidu pan / asus armoury crate by a parallel
 # session's exe-downloader). CLAUDE_CODE_SESSION_ID is set by Claude Code

@@ -11,7 +11,9 @@ tab landed in the user's main window (tabs were m365 + a Tailscale-addressed
 sub2api panel, neither of which was listed at the time).
 """
 import contextlib
+import os
 import sys
+import time
 import types
 
 import pytest
@@ -205,3 +207,76 @@ def test_prune_only_reaps_tabs_carrying_our_marker(monkeypatch):
 
     assert all(t.startswith("ours-") for t in closed), \
         f"prune closed the user's tabs: {[t for t in closed if not t.startswith('ours-')]}"
+
+
+# ---------- lock ownership: a slow holder must not lose its lock ----------
+
+def test_lock_holder_alive_reads_the_recorded_pid(tmp_path, monkeypatch):
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"{os.getpid()}\n{time.time()}", encoding="utf-8")
+    assert sw._lock_holder_alive(lock) is True
+
+    lock.write_text("999999999\n0", encoding="utf-8")
+    monkeypatch.setattr(sw, "_pid_alive", lambda pid: pid == os.getpid())
+    assert sw._lock_holder_alive(lock) is False, \
+        "a provably dead holder should be reapable"
+
+
+def test_unreadable_lock_is_treated_as_held(tmp_path):
+    """Can't verify → don't steal. Age gating already limits the damage."""
+    lock = tmp_path / "x.lock"
+    lock.write_text("not-a-pid", encoding="utf-8")
+    assert sw._lock_holder_alive(lock) is True
+
+
+def test_release_leaves_a_reassigned_lock_alone(tmp_path):
+    """The bug this prevents: our finally: deleting somebody else's lock.
+
+    Sequence: we hold the lock, we stall, a reaper decides we're dead and takes
+    it, then we wake up and run our finally. Deleting it there would let a third
+    process in while the reaper is still inside its critical section.
+    """
+    lock = tmp_path / "x.lock"
+    lock.write_text("424242\n0", encoding="utf-8")  # someone else's pid
+    sw._release_lock_if_mine(lock)
+    assert lock.exists(), "released a lock that had been reassigned"
+
+
+def test_release_removes_our_own_lock(tmp_path):
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"{os.getpid()}\n{time.time()}", encoding="utf-8")
+    sw._release_lock_if_mine(lock)
+    assert not lock.exists()
+
+
+# ---------- _pid_alive: uncertainty must read as alive ----------
+
+def test_pid_alive_self():
+    assert sw._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_rejects_falsy():
+    assert sw._pid_alive(0) is False
+    assert sw._pid_alive(None) is False
+
+
+def test_pid_alive_says_alive_when_it_cannot_tell(monkeypatch):
+    """Docstring promised conservative-on-uncertainty; implementation didn't.
+
+    A live process at a different integrity level denies OpenProcess, and the old
+    code read that denial as "dead" — which let callers steal its lock and
+    reclaim its tabs.
+    """
+    if os.name != "nt":
+        pytest.skip("windows-specific path")
+
+    import ctypes
+    ERROR_ACCESS_DENIED = 5
+
+    class FakeK32:
+        def SetLastError(self, _): pass
+        def OpenProcess(self, *a): return 0          # denied
+        def GetLastError(self): return ERROR_ACCESS_DENIED
+    monkeypatch.setattr(ctypes, "windll",
+                        types.SimpleNamespace(kernel32=FakeK32()))
+    assert sw._pid_alive(4) is True, "access-denied must not read as dead"

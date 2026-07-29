@@ -83,7 +83,12 @@ def ensure_pinned_second_window(wait=30.0):
                     age = _time.time() - _SPAWN_LOCK_PATH.stat().st_mtime
                 except FileNotFoundError:
                     age = 0  # released — pin should appear momentarily
-                if age > 60:
+                # Age alone is not evidence the holder died — a slow spawn (cold
+                # Chrome, "Allow remote debugging" prompt waiting on a human) can
+                # exceed 60s while perfectly healthy. Stealing the lock then puts
+                # two clients into spawn at once, which is the "6 parallel clients
+                # opened 6 windows" failure this lock exists to prevent.
+                if age > 60 and not _sw._lock_holder_alive(_SPAWN_LOCK_PATH):
                     try: _SPAWN_LOCK_PATH.unlink()
                     except FileNotFoundError: pass
                     try:
@@ -124,8 +129,8 @@ def ensure_pinned_second_window(wait=30.0):
         return wid
     finally:
         if held_lock:
-            try: _SPAWN_LOCK_PATH.unlink()
-            except FileNotFoundError: pass
+            # Only remove it if it's still ours — a reaper may have reassigned it.
+            _sw._release_lock_if_mine(_SPAWN_LOCK_PATH)
 
 
 def _close_placeholder_tabs():
