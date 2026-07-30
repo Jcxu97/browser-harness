@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Browser-Harness Companion",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Silent agent tab + window spawner for browser-harness. Uses chrome.tabs.create({active:false}) and chrome.windows.create({focused:false,state:'minimized'}) to avoid focus steal.",
   "permissions": [
     "tabs",
-    "alarms"
+    "alarms",
+    "storage"
   ],
   "host_permissions": [
     "http://127.0.0.1:9223/*"

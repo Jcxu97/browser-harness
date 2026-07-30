@@ -21,14 +21,39 @@ PORT = 9223
 SERVER_HOST = "127.0.0.1"
 
 
+def _bridge_token():
+    """Shared secret for the bridge. Python side reads it straight off disk."""
+    from .bh_extension_server import load_or_create_token
+    try:
+        return load_or_create_token()
+    except Exception:
+        return ""
+
+
 def _http_request(method, path, body=None, timeout=2.0):
+    """One-shot request. Always carries the bridge token.
+
+    The token became mandatory 2026-07-30: without it any local process could
+    read every tab's URL+title and drive chrome.tabs.*. See bh_extension_server.
+    """
     c = http.client.HTTPConnection(SERVER_HOST, PORT, timeout=timeout)
-    headers = {"Content-Type": "application/json"} if body else {}
+    headers = {"X-BH-Token": _bridge_token()}
+    if body:
+        headers["Content-Type"] = "application/json"
     raw = json.dumps(body).encode("utf-8") if body else None
-    c.request(method, path, body=raw, headers=headers)
-    r = c.getresponse()
-    data = r.read()
-    return r.status, (json.loads(data) if data else {})
+    try:
+        c.request(method, path, body=raw, headers=headers)
+        r = c.getresponse()
+        data = r.read()
+        return r.status, (json.loads(data) if data else {})
+    finally:
+        # Every call used to leak its connection; ensure_agent_tab alone makes
+        # ~20 is_available() probes per spawn, and the server spends a thread on
+        # each one it holds open.
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 def is_available():
@@ -43,12 +68,21 @@ def is_available():
 
 
 def server_is_up():
-    """Just checks if local server responds (extension may not be connected yet)."""
+    """Is OUR bridge on this port (extension may not be connected yet)?
+
+    Identity matters, not just liveness: 9223 is also a Chrome debug-port
+    candidate elsewhere in this package (daemon.py, run.py). A foreign service
+    answering 404 used to read as "not up", so every BH call spawned another
+    server that could never bind, then burned 3s waiting for it.
+    A 401 proves it IS our bridge (only ours knows to demand a token).
+    """
     try:
-        status, _ = _http_request("GET", "/status", timeout=0.5)
-        return status == 200
+        status, data = _http_request("GET", "/status", timeout=0.5)
     except Exception:
         return False
+    if status == 401:
+        return True  # ours, we just failed auth (stale token file, say)
+    return status == 200 and "extension_connected" in (data or {})
 
 
 def start_server_if_needed():

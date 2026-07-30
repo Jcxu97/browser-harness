@@ -7,10 +7,45 @@ const POLL_INTERVAL_ON_ERROR_MS = 2000;
 
 let pollRunning = false;
 
+// Bridge token. The server demands it on every endpoint (added 2026-07-30 —
+// before that, any local process could read every tab's URL/title and drive
+// chrome.tabs.*). An extension can't read the token file, so the first
+// unauthenticated poll returns the token and no commands; we keep it in
+// session storage and echo it from then on. Session storage rather than a
+// plain variable so a recycled service worker doesn't have to re-bootstrap.
+let bridgeToken = null;
+
+async function loadToken() {
+  if (bridgeToken) return bridgeToken;
+  try {
+    const got = await chrome.storage.session.get("bhBridgeToken");
+    if (got && got.bhBridgeToken) bridgeToken = got.bhBridgeToken;
+  } catch (e) { /* storage.session unavailable — fall back to in-memory */ }
+  return bridgeToken;
+}
+
+async function saveToken(tok) {
+  bridgeToken = tok;
+  try {
+    await chrome.storage.session.set({ bhBridgeToken: tok });
+  } catch (e) { /* in-memory only is fine for this session */ }
+}
+
 async function pollOnce() {
-  const resp = await fetch(`${SERVER}/poll`, { method: "POST" });
+  await loadToken();
+  const resp = await fetch(`${SERVER}/poll`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bridgeToken ? { token: bridgeToken } : {})
+  });
   if (!resp.ok) throw new Error(`poll HTTP ${resp.status}`);
   const data = await resp.json();
+  // Handshake: server hands out the token when we polled without one. Store it
+  // and return — the next poll authenticates and starts receiving commands.
+  if (data.token) {
+    await saveToken(data.token);
+    return;
+  }
   const cmds = data.commands || [];
   for (const cmd of cmds) {
     let result;
@@ -22,7 +57,7 @@ async function pollOnce() {
     await fetch(`${SERVER}/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: cmd.id, result })
+      body: JSON.stringify({ id: cmd.id, result, token: bridgeToken })
     });
   }
 }
