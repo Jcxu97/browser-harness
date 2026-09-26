@@ -314,6 +314,47 @@ product = extract_product_detail(html)
 
 ---
 
+## Store / Delivery Location
+
+Results are per store. Ranking, badges ("Best seller", "N+ bought since yesterday"), sellers
+and fulfillment all change with the location Walmart assigns. It picks that location from
+the visitor's IP, so two sessions on different IPs can return the same page in different orders.
+
+### Where the served location is
+
+```
+data.props.pageProps.initialData.pageMetadata.location
+  .postalCode            — "95829"
+  .storeId               — "3081"  (also .pickupStore / .deliveryStore)
+  .city, .stateOrProvinceCode, .intentStrength ("IMPLICIT" = derived, not chosen)
+data.props.pageProps.countryRegion
+  .countryCode           — the visitor's IP country, or "not-available"
+```
+
+`pageMetadata.location` is there on browse (`/browse/...`) and seller (`/seller/<id>`) pages.
+`countryRegion` and `searchResult.paginationV2.pageProperties.stores`, which echoes the store,
+appear on browse pages only.
+
+### Default location for visitors Walmart can't place
+
+Walmart can't place any non-US IP, and then `countryRegion.countryCode` is `"not-available"`.
+Such a visitor always gets the same default location:
+**ZIP 95829, store 3081 (Sacramento, CA)**, flagged `isDefaulted=true` in the
+`searchResult.debug.sisUrl` query string. The search itself then runs with
+`zipcode=94066&extended_zipcode=95829`. A desktop browser outside the US shows
+"Sacramento, 95829" in the header for the same reason.
+
+To keep results comparable across runs and sessions, send every request from one fixed
+non-US country, for example a proxy exit in IL. Each session then lands on 95829 / store 3081.
+US residential IPs each get their nearest store, and the results reorder from session
+to session. Always check `pageMetadata.location.postalCode` on every page, whatever the proxy
+promises, and drop a session that comes back with a different ZIP.
+
+Field-tested 2026-09-26 through the Bright Data Scraping Browser with `-country-il`:
+10 consecutive browse pages in one session all served 95829 / 3081.
+
+---
+
 ## Anti-Bot: PerimeterX
 
 Walmart uses **PerimeterX** (app ID `PXu6b0qd2S`, confirmed in `runtimeConfig.perimeterX`).
