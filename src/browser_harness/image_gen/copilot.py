@@ -66,8 +66,9 @@ GRACE_AFTER_DONE = 120  # how long to keep polling without reload after the
 POLL_INTERVAL = 4.0
 PROMPT_PREFIX = "生成图片："
 # The UI is Chinese or English, and the model name changes with each release
-# (GPT 5.5 深度思考 in 2026-05, GPT 5.6 Sol Think deeper in 2026-10).
-DEEP_GPT = re.compile(r"GPT.*(深度思考|think deeper)", re.I)
+# (GPT 5.5 深度思考 in 2026-05, GPT 5.6 Sol Think deeper in 2026-10). The
+# selector button shows a short name, for example "GPT 5.6 Sol Think".
+DEEP_GPT = re.compile(r"GPT.*(深度|思考|think)", re.I)
 
 
 # ---------- tab routing ----------
