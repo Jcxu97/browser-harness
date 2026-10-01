@@ -1,18 +1,15 @@
 """
 Client for the BH companion Chrome extension. Talks to bh_extension_server
-running on 127.0.0.1:9223.
+on 127.0.0.1:9223.
 
-Public API:
-    is_available()                       # extension connected?
-    start_server_if_needed()             # spawn server daemon
-    send_command(action, **params)       # generic RPC
-    spawn_agent_tab_in_window(wid)       # spawn into an ALREADY-VETTED window
+    is_available()                   extension connected?
+    start_server_if_needed()         spawn the server daemon
+    send_command(action, **params)   one command, answered before its deadline
 """
 
 import http.client
 import json
-import os
-import pathlib
+import secrets
 import subprocess
 import sys
 import time
@@ -21,97 +18,83 @@ PORT = 9223
 SERVER_HOST = "127.0.0.1"
 
 
-def _bridge_token():
-    """Shared secret for the bridge. Python side reads it straight off disk."""
-    from .bh_extension_server import load_or_create_token
-    try:
-        return load_or_create_token()
-    except Exception:
-        return ""
+def _auth_header(method, path, body):
+    from .bh_extension_server import load_or_create_token, sign
+    ts, nonce = str(int(time.time() * 1000)), secrets.token_hex(12)
+    mac = sign(load_or_create_token(), "client", f"{method} {path}\n{ts}\n{nonce}\n{body}")
+    return f"{ts}.{nonce}.{mac}"
 
 
-def _http_request(method, path, body=None, timeout=2.0):
-    """One-shot request. Always carries the bridge token.
-
-    The token became mandatory 2026-07-30: without it any local process could
-    read every tab's URL+title and drive chrome.tabs.*. See bh_extension_server.
-    """
+def _http_request(method, path, body=None, timeout=2.0, headers=None):
+    raw = json.dumps(body) if body is not None else ""
     c = http.client.HTTPConnection(SERVER_HOST, PORT, timeout=timeout)
-    headers = {"X-BH-Token": _bridge_token()}
-    if body:
-        headers["Content-Type"] = "application/json"
-    raw = json.dumps(body).encode("utf-8") if body else None
+    hdrs = {"X-BH-Auth": _auth_header(method, path, raw)}
+    hdrs.update(headers or {})
+    if raw:
+        hdrs["Content-Type"] = "application/json"
     try:
-        c.request(method, path, body=raw, headers=headers)
+        c.request(method, path, body=raw.encode("utf-8") if raw else None, headers=hdrs)
         r = c.getresponse()
         data = r.read()
-        return r.status, (json.loads(data) if data else {})
+        try:
+            return r.status, (json.loads(data) if data else {})
+        except ValueError:
+            return r.status, {}
     finally:
-        # Every call used to leak its connection; ensure_agent_tab alone makes
-        # ~20 is_available() probes per spawn, and the server spends a thread on
-        # each one it holds open.
         try:
             c.close()
         except Exception:
             pass
 
 
-def is_available():
-    """True if bh-ext-server is running AND extension polled within 35s."""
+def _status():
     try:
-        status, data = _http_request("GET", "/status", timeout=0.5)
-        if status != 200:
-            return False
-        return bool(data.get("extension_connected"))
+        return _http_request("GET", "/status", timeout=0.5)
     except Exception:
-        return False
+        return None, None
+
+
+def is_available():
+    """True when our server runs AND the extension polled in the last 35 s."""
+    status, data = _status()
+    return status == 200 and bool((data or {}).get("extension_connected"))
 
 
 def server_is_up():
-    """Is OUR bridge on this port (extension may not be connected yet)?
+    status, data = _status()
+    return status == 200 and (data or {}).get("protocol") == 2
 
-    Identity matters, not just liveness: 9223 is also a Chrome debug-port
-    candidate elsewhere in this package (daemon.py, run.py). A foreign service
-    answering 404 used to read as "not up", so every BH call spawned another
-    server that could never bind, then burned 3s waiting for it.
-    A 401 proves it IS our bridge (only ours knows to demand a token).
-    """
+
+def _stop_legacy_server():
+    """A server from before protocol 2 answers 401 to the new auth. It took the
+    raw token from <config dir>/extension-bridge.token; use that to stop it."""
     try:
-        status, data = _http_request("GET", "/status", timeout=0.5)
+        from . import paths
+        legacy = (paths.config_dir() / "extension-bridge.token").read_text(encoding="utf-8").strip()
     except Exception:
-        return False
-    if status == 401:
-        return True  # ours, we just failed auth (stale token file, say)
-    return status == 200 and "extension_connected" in (data or {})
+        return
+    try:
+        _http_request("POST", "/shutdown", body={"token": legacy}, timeout=2.0,
+                      headers={"X-BH-Token": legacy})
+    except Exception:
+        pass
+    time.sleep(0.5)
 
 
 def start_server_if_needed():
-    """
-    Spawn bh_extension_server as detached background daemon if not running.
-    Returns True when server is reachable.
-    """
-    if server_is_up():
+    """Spawn bh_extension_server as a detached daemon. True when it answers."""
+    status, data = _status()
+    if status == 200 and (data or {}).get("protocol") == 2:
         return True
-    # Spawn detached
+    if status == 401 and (data or {}).get("protocol") != 2:
+        _stop_legacy_server()
+    kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if sys.platform == "win32":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NO_WINDOW = 0x08000000
-        subprocess.Popen(
-            [sys.executable, "-m", "browser_harness.bh_extension_server"],
-            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+        DETACHED_PROCESS, CREATE_NO_WINDOW = 0x00000008, 0x08000000
+        kwargs.update(creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW, close_fds=True)
     else:
-        subprocess.Popen(
-            [sys.executable, "-m", "browser_harness.bh_extension_server"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        kwargs.update(start_new_session=True)
+    subprocess.Popen([sys.executable, "-m", "browser_harness.bh_extension_server"], **kwargs)
     for _ in range(20):
         time.sleep(0.15)
         if server_is_up():
@@ -119,86 +102,19 @@ def start_server_if_needed():
     return False
 
 
-def send_command(action, timeout=30, **params):
-    """Send a command to the extension and wait for the result."""
-    payload = {"action": action, **params}
+def send_command(action, timeout=10, **params):
+    """Run one extension action. The server drops it when timeout passes."""
+    payload = {"action": action, "timeout": timeout, **params}
     status, data = _http_request("POST", "/command", body=payload, timeout=timeout + 5)
     if status != 200:
-        raise RuntimeError(f"extension command failed: HTTP {status} {data}")
-    return data.get("result")
-
-
-def spawn_agent_tab_in_window(window_id, url=None):
-    """
-    Create an agent tab in the specified existing window using
-    chrome.tabs.create({active:false, windowId:X}). True zero focus steal.
-    Returns (targetId, nonce) tuple, or (None, None) on failure.
-
-    Caller must have already verified `window_id` exists. This function does
-    NOT detect or create windows — it just creates a tab in a given window.
-
-    Concurrency note: two parallel callers must NOT receive the same targetId
-    (else they'll fight over one tab). We tag the URL with a unique nonce per
-    call so the scan-back step matches only OUR new tab, not someone else's
-    concurrent example.com agent tab. The nonce is also returned so the
-    caller can persist it for placeholder identification at atexit time
-    (substring 'bh-agent-tab' in URL is too loose — see I05 bug).
-    """
-    if not is_available():
-        return None, None
-    import os, time as _time, uuid as _uuid
-    from .second_window import AGENT_SPAWN_URL, _get_owner_id
-    base_url = (url or AGENT_SPAWN_URL).split("#")[0]
-    # Append unique nonce so concurrent calls don't collide on URL match.
-    # Prefix is the owner id (sanitised: "session:<uuid>" / "pid:<n>" → '-')
-    # rather than a bare pid, so a leaked placeholder in the URL bar names the
-    # session that leaked it, matching the CDP-fallback path in second_window.
-    # Uniqueness comes from the uuid4 suffix regardless.
-    _owner = _get_owner_id().replace(":", "-")
-    nonce = f"bh-nonce={_owner}-{int(_time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
-    sep = "&" if "?" in base_url else "?"
-    target_url = f"{base_url}{sep}{nonce}"
-    result = send_command("create_tab",
-                          windowId=window_id,
-                          url=target_url,
-                          active=False,
-                          timeout=10)
-    if not result or "tabId" not in result:
-        return None, None
-
-    # Map chrome integer tabId → CDP hex targetId by matching the unique nonce.
-    from .helpers import cdp
-    _time.sleep(0.4)
-    targets = cdp("Target.getTargets").get("targetInfos", [])
-    for t in targets:
-        if t.get("type") != "page":
-            continue
-        if nonce in (t.get("url") or ""):
-            return t.get("targetId"), nonce
-    # Nonce not yet in URL (slow page load); fall back to a brief retry loop
-    for _ in range(8):
-        _time.sleep(0.25)
-        targets = cdp("Target.getTargets").get("targetInfos", [])
-        for t in targets:
-            if t.get("type") == "page" and nonce in (t.get("url") or ""):
-                return t.get("targetId"), nonce
-    return None, None
-
-
-# Back-compat alias (older code may still import this name).
-# REMOVED 2026-07-30: ensure_agent_tab_via_extension()
-#
-# It picked the window with the FEWEST tabs and spawned there, with no
-# USER_DOMAINS check — the exact heuristic that put agent tabs into the user's
-# main window on 2026-05-20 (their main window was the tidy one). It had no
-# callers, so it survived only as a trap for whoever called it next.
-#
-# Correct path: second_window.ensure_agent_tab(), which runs detection, the
-# user-content guard, and _assert_landed_in() afterwards.
+        raise RuntimeError(f"extension command {action} failed: HTTP {status} {data}")
+    result = (data or {}).get("result")
+    if isinstance(result, dict) and result.get("error"):
+        raise RuntimeError(f"extension command {action} failed: {result['error']}")
+    return result
 
 
 def stop_server():
-    """Admin: stop the daemon."""
     try:
         _http_request("POST", "/shutdown", body={}, timeout=2)
     except Exception:

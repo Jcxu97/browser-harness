@@ -16,3 +16,6 @@ chrome-profile-bid/
 # soak test outputs
 tests/soak-1999/results/*.jsonl
 workspace/
+
+# extension bridge secret, written by bh_extension_server
+extension/bridge-token.txt

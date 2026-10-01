@@ -333,9 +333,12 @@ def _extension(wait=5.0):
     """The extension client when the companion extension is connected, else None."""
     try:
         from . import bh_extension_client as ext
-        if not ext.start_server_if_needed():
+        was_up = ext.server_is_up()
+        if not was_up and not ext.start_server_if_needed():
             return None
-        deadline = time.time() + wait
+        # A live extension polls without a break, so only a server that just
+        # started needs time for the first poll.
+        deadline = time.time() + (1.0 if was_up else wait)
         while not ext.is_available():
             if time.time() >= deadline:
                 return None
