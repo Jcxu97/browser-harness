@@ -33,7 +33,7 @@ chrome.tabs.create({active:false, windowId:X}) for ZERO focus steal. Fallback
 is the CDP `window.open` path with focus-restore mitigation.
 """
 
-import json, time, pathlib, subprocess, base64, os, contextlib
+import json, time, pathlib, subprocess, base64, os, sys, threading, contextlib
 from collections import defaultdict
 
 from .helpers import cdp
@@ -825,6 +825,9 @@ def spawn_second_window(timeout=10):
     # Smart-focus: subprocess path raised new window; pull main back to
     # foreground without touching its active tab.
     _smart_focus_main_window(main_snapshot)
+    # Extension-independent backstop. Runs after the CDP minimize above so it
+    # reclaims the foreground the new window took. No-ops when smart-focus
+    # already succeeded (we skip if the HWND is foreground again).
     if new_wid is None:
         raise RuntimeError("spawn_second_window: timeout")
     return new_wid

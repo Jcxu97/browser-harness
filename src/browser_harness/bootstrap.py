@@ -259,8 +259,31 @@ _DEAD_TID_NEEDLES = (
 )
 
 
+# Prefix that evaluate_agent uses when it is relaying a *page's own* JS error.
+# Anything after it is attacker/site-controlled text and must not be scanned for
+# our needles.
+_PAGE_ERROR_MARKERS = (
+    "JavaScript evaluation failed:",
+)
+
+
 def _is_dead_tid(exc):
+    """Does this exception mean our cached targetId is gone?
+
+    2026-07-30: this used to substring-match the raw message. evaluate_agent
+    splices the *page's* error description into its RuntimeError, so a site whose
+    JS throws "Target closed" (its own logging layer, or any page that discusses
+    CDP) could convince us the tab had died. We would then rebind to a brand new
+    blank tab and re-run the same JS there, returning a plausible empty result —
+    a silent wrong answer, worse than an exception.
+
+    So: strip the relayed page text before looking for our needles.
+    """
     msg = str(exc)
+    for marker in _PAGE_ERROR_MARKERS:
+        idx = msg.find(marker)
+        if idx != -1:
+            msg = msg[:idx]  # keep only our own framing
     return any(needle in msg for needle in _DEAD_TID_NEEDLES)
 
 
@@ -289,50 +312,93 @@ def safe_globals():
         atexit.register(_close_placeholder_tabs)
         _atexit_registered = True
 
-    def _with_self_heal(fn):
-        """Run fn(tab); if the tid is dead, rebind once and retry."""
+    def _with_self_heal(fn, *, replayable):
+        """Run fn(tab); if the tid is dead, rebind once.
+
+        `replayable` decides what happens after the rebind:
+
+        True  — re-run fn on the fresh tab. Only goto: it fully defines the
+                new tab's state. snap/shot/eval_js on a fresh blank tab return
+                a plausible empty answer instead of an error, and eval_js may
+                also have side effects.
+
+        False — rebind but do NOT re-run; raise instead. The new tab is a
+                different page (possibly a blank placeholder, possibly another of
+                this session's tabs), so replaying a *positional or mutating*
+                action there is not a retry, it's a misfire. Concretely
+                (2026-07-30 review): the agent fills a long form on site A, the
+                user closes that tab, the next `click_at(720, 430)` sees a dead
+                tid, rebinds to a tab that happens to hold a banking page, and
+                clicks blindly at those coordinates. `upload()` is worse — the
+                file lands in some other site's input. Coordinates from a snap()
+                of the old tab mean nothing on the new one.
+
+                The caller gets a clear error and can re-derive state (snap
+                again, re-locate the element) before deciding to retry.
+        """
         try:
             return fn(tab_box[0])
         except Exception as e:
             if not _is_dead_tid(e):
                 raise
             tab_box[0] = _sw.ensure_agent_tab()
-            return fn(tab_box[0])
+            if replayable:
+                return fn(tab_box[0])
+            raise RuntimeError(
+                "agent tab died mid-action, so this action was NOT replayed on "
+                "the replacement tab (page state does not carry over). Rebound to "
+                f"{tab_box[0]}; call goto() again and retry. Original error: {e}"
+            ) from e
 
     def goto(url, timeout=15):
-        return _with_self_heal(lambda t: _sw.navigate_agent(t, url, timeout=timeout))
+        return _with_self_heal(lambda t: _sw.navigate_agent(t, url, timeout=timeout),
+                              replayable=True)
 
     def eval_js(expression):
-        return _with_self_heal(lambda t: _sw.evaluate_agent(t, expression))
+        return _with_self_heal(lambda t: _sw.evaluate_agent(t, expression),
+                              replayable=False)
 
     def snap(max_chars=10000):
-        return _with_self_heal(lambda t: _sw.snapshot_agent(t, max_chars=max_chars))
+        return _with_self_heal(lambda t: _sw.snapshot_agent(t, max_chars=max_chars),
+                              replayable=False)
 
     def shot(path):
-        return _with_self_heal(lambda t: _sw.screenshot_agent(t, path))
+        return _with_self_heal(lambda t: _sw.screenshot_agent(t, path),
+                              replayable=False)
 
     def click_at(x, y, button="left"):
-        return _with_self_heal(lambda t: _sw.click_at_agent(t, x, y, button=button))
+        return _with_self_heal(lambda t: _sw.click_at_agent(t, x, y, button=button),
+                              replayable=False)
 
     def type_text(text):
-        return _with_self_heal(lambda t: _sw.key_type_agent(t, text))
+        return _with_self_heal(lambda t: _sw.key_type_agent(t, text),
+                              replayable=False)
 
     def send_keys(keys):
-        return _with_self_heal(lambda t: _sw.send_keys_agent(t, keys))
+        return _with_self_heal(lambda t: _sw.send_keys_agent(t, keys),
+                              replayable=False)
 
     def hotkey(chord):
-        return _with_self_heal(lambda t: _sw.hotkey_agent(t, chord))
+        return _with_self_heal(lambda t: _sw.hotkey_agent(t, chord),
+                              replayable=False)
 
     def fill(selector, value):
-        return _with_self_heal(lambda t: _sw.fill_agent(t, selector, value))
+        return _with_self_heal(lambda t: _sw.fill_agent(t, selector, value),
+                              replayable=False)
 
     def upload(selector, file_paths):
-        return _with_self_heal(lambda t: _sw.upload_agent(t, selector, file_paths))
+        return _with_self_heal(lambda t: _sw.upload_agent(t, selector, file_paths),
+                              replayable=False)
 
     def close_tab():
         # Intentionally not self-healed: closing a tab and immediately rebinding
         # would defeat the user's explicit intent. The next *other* call (goto,
         # eval_js, ...) will rebind via _with_self_heal.
+        if tab_box[0] is None:
+            # Second consecutive close_tab(). Previously this passed None to
+            # closeTarget, which failed inside close_agent_tab's blanket except
+            # and returned a bare False with no explanation.
+            return False
         result = _sw.close_agent_tab(tab_box[0])
         # Mark dead so the next call definitely rebinds (some BH builds return
         # success even when CDP closeTarget already lost the session).
