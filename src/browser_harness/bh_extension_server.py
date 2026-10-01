@@ -24,6 +24,7 @@ import os
 import pathlib
 import queue
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -235,9 +236,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._respond(504, {"error": "extension did not answer before the deadline"})
 
 
+class _Server(http.server.ThreadingHTTPServer):
+    # On Windows, SO_REUSEADDR lets a second server listen on a port in use, and
+    # each connection then goes to one of them (seen 2026-10-01: 3 servers on
+    # 9223 with 2 tokens). The extension polled one, BH asked another.
+    if sys.platform == "win32":
+        allow_reuse_address = False
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 def serve(port=DEFAULT_PORT):
     load_or_create_token()
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = _Server(("127.0.0.1", port), Handler)
     print(f"[bh-ext-server] listening on 127.0.0.1:{port}")
     try:
         httpd.serve_forever()

@@ -46,6 +46,23 @@ DEFAULT_MAX_AGENT_TABS = 15
 # covers PID reuse.
 LEASE_IDLE_SECONDS = 1800
 PLACEHOLDER_REAP_AGE_SECONDS = 60
+# Keeps links and window.open() of agent pages in the same tab. When a page
+# opens a new tab, Chrome shows and activates its window (AddNewContents uses
+# kShowWindow), so the minimized agent window would jump over the user's app.
+SAME_TAB_JS = r"""(() => {
+  if (window.__bhSameTab) return;
+  window.__bhSameTab = true;
+  window.open = function (url) {
+    if (url) location.assign(new URL(String(url), location.href).href);
+    return null;
+  };
+  const same = (e) => {
+    const el = e.target && e.target.closest && e.target.closest("a[target], area[target], form[target]");
+    if (el && !["_self", "_top", "_parent"].includes(el.target.toLowerCase())) el.target = "_self";
+  };
+  document.addEventListener("click", same, true);
+  document.addEventListener("submit", same, true);
+})();"""
 SPAWN_FOCUS_WARNING = (
     "[bh.second_window] The companion extension is not connected. The new agent "
     "tab opens in a minimized window of its own."
@@ -329,16 +346,20 @@ def _window_of(tid):
         return None
 
 
-def _extension(wait=5.0):
-    """The extension client when the companion extension is connected, else None."""
+def _extension(wait=5.0, patient=False):
+    """The extension client when the companion extension is connected, else None.
+    patient: when the extension polled in the last 2 minutes, wait up to 35 s
+    for its next poll. Chrome may have stopped its worker, and the 30 s alarm
+    starts it again."""
     try:
         from . import bh_extension_client as ext
         was_up = ext.server_is_up()
         if not was_up and not ext.start_server_if_needed():
             return None
-        # A live extension polls without a break, so only a server that just
-        # started needs time for the first poll.
-        deadline = time.time() + (1.0 if was_up else wait)
+        if was_up:
+            age = ext.last_poll_age() if patient else None
+            wait = 35.0 if age is not None and age < 120 else 1.0
+        deadline = time.time() + wait
         while not ext.is_available():
             if time.time() >= deadline:
                 return None
@@ -408,24 +429,18 @@ def _spawn_agent_window():
         state["agent_window"] = {"nonce": nonce, "created_at": time.time()}
         state.pop("pinned_second_window_id", None)
         _save_state(state)
-    ext = _extension()
-    if ext is not None:
-        try:
-            ext.send_command("create_window", url=url, state="minimized", focused=False, timeout=8)
-        except Exception:
-            ext = None
-    if ext is None:
-        print(SPAWN_FOCUS_WARNING, file=sys.stderr)
-        cdp("Target.createTarget", url=url, newWindow=True, background=True, windowState="minimized")
+    # Not the extension: chrome.windows.create with focused:false shows the
+    # window inactive but not minimized, on top of the user's app (seen
+    # 2026-10-01). CDP shows it inactive and minimizes it in the same step.
+    cdp("Target.createTarget", url=url, newWindow=True, background=True, windowState="minimized")
     deadline = time.time() + 10
     while time.time() < deadline:
         wid, _ = find_agent_window()
         if wid is not None:
-            if ext is None:
-                try:
-                    cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "minimized"})
-                except Exception:
-                    pass
+            try:
+                cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "minimized"})
+            except Exception:
+                pass
             return wid
         time.sleep(0.2)
     raise RuntimeError("the agent window did not appear after spawn")
@@ -461,7 +476,7 @@ def _spawn_agent_tab(wid, use_extension=True):
     for a tab in the agent window, else the window that holds only this tab."""
     nonce = _new_nonce()
     url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
-    ext = _extension() if use_extension else None
+    ext = _extension(patient=True) if use_extension else None
     if ext is None:
         # CDP cannot add a tab to the minimized agent window without focus:
         # window.open() made Chrome restore and activate it (seen 2026-10-01).
@@ -679,6 +694,11 @@ def _session_for(tid):
     try:
         # Pages in the minimized agent window then behave as if they have focus.
         cdp("Emulation.setFocusEmulationEnabled", session_id=sid, enabled=True)
+    except Exception:
+        pass
+    try:
+        cdp("Page.addScriptToEvaluateOnNewDocument", session_id=sid, source=SAME_TAB_JS)
+        cdp("Runtime.evaluate", session_id=sid, expression=SAME_TAB_JS)
     except Exception:
         pass
     _SESSIONS[tid] = sid

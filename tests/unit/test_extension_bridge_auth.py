@@ -106,7 +106,7 @@ def test_signature_covers_the_body(bridge):
     """A captured signature must not authorize a different command."""
     signed = json.dumps({"action": "ping"})
     headers = _client_auth("POST", "/command", raw=signed)
-    code, _, _ = _request(bridge, "POST", "/command", {"action": "create_window"}, headers=headers)
+    code, _, _ = _request(bridge, "POST", "/command", {"action": "create_tab"}, headers=headers)
     assert code == 401
 
 
@@ -154,9 +154,9 @@ def test_extension_error_raises(bridge):
 
 def test_expired_command_is_never_delivered(bridge):
     """A caller that gave up must not have its command run later, for example a
-    create_window that arrives after the caller already used the CDP fallback."""
+    create_tab that arrives after the caller already used the CDP fallback."""
     with pytest.raises(RuntimeError, match="HTTP 504"):
-        client.send_command("create_window", url="https://example.com/", timeout=0.3)
+        client.send_command("create_tab", windowId=5, url="https://example.com/", timeout=0.3)
     code, data, _ = _poll(bridge)
     assert code == 200 and data["commands"] == []
 
@@ -186,6 +186,17 @@ def test_token_is_stable_and_long(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.tmp.*"))
 
 
+def test_second_server_cannot_share_the_port():
+    """On Windows, 3 servers listened on 9223 at once, and each request went to
+    a random one."""
+    first = srv._Server(("127.0.0.1", 0), srv.Handler)
+    try:
+        with pytest.raises(OSError):
+            srv._Server(("127.0.0.1", first.server_address[1]), srv.Handler)
+    finally:
+        first.server_close()
+
+
 # background.js itself, run in Node with chrome.* stubbed. Skipped without Node.
 
 _BACKGROUND_JS = __import__("pathlib").Path(__file__).resolve().parents[2] / "extension" / "background.js"
@@ -196,6 +207,7 @@ const [port, token, bg] = process.argv.slice(2);
 const log = (x) => console.log(JSON.stringify(x));
 globalThis.chrome = {
   runtime: { getURL: (p) => `chrome-extension://bh/${p}`, getManifest: () => ({ version: "test" }),
+             getPlatformInfo: async () => ({ os: "test" }),
              onInstalled: { addListener() {} }, onStartup: { addListener() {} }, reload() {} },
   alarms: { create() {}, onAlarm: { addListener() {} } },
   tabs: { create: async (o) => { log(["create_tab", o]); return { id: 11, windowId: o.windowId }; } },
@@ -237,15 +249,13 @@ def test_background_js_round_trip(bridge, tmp_path):
     try:
         assert client.send_command("create_tab", windowId=5, url="https://example.com/", timeout=8) == \
             {"tabId": 11, "windowId": 5}
-        # The extension ignores what the caller asks and always opens a hidden window.
-        client.send_command("create_window", url="https://example.com/", state="normal", focused=True, timeout=5)
         assert client.send_command("ping", timeout=5)["pong"] is True
-        with pytest.raises(RuntimeError, match="unknown action"):
-            client.send_command("list_windows", timeout=5)
+        for action in ("create_window", "list_windows"):
+            with pytest.raises(RuntimeError, match="unknown action"):
+                client.send_command(action, timeout=5)
     finally:
         calls = _chrome_calls(proc)
-    assert ["create_tab", {"url": "https://example.com/", "windowId": 5, "active": False}] in calls
-    assert ["create_window", {"url": "https://example.com/", "focused": False, "state": "minimized"}] in calls
+    assert calls == [["create_tab", {"url": "https://example.com/", "windowId": 5, "active": False}]]
 
 
 @pytest.mark.skipif(not _node(), reason="node not installed")
@@ -255,8 +265,8 @@ def test_background_js_ignores_forged_and_late_commands(tmp_path):
     import http.server
 
     now_ms = int(time.time() * 1000)
-    forged = json.dumps({"id": "f", "action": "create_window", "url": "https://forged/", "deadline": now_ms + 60000})
-    late = json.dumps({"id": "l", "action": "create_window", "url": "https://late/", "deadline": now_ms - 1})
+    forged = json.dumps({"id": "f", "action": "create_tab", "url": "https://forged/", "deadline": now_ms + 60000})
+    late = json.dumps({"id": "l", "action": "create_tab", "url": "https://late/", "deadline": now_ms - 1})
     good = json.dumps({"id": "g", "action": "create_tab", "url": "https://good/", "deadline": now_ms + 60000})
     replies = [[{"payload": forged, "sig": srv.sign("ef" * 32, "cmd", forged)}],
                [{"payload": late, "sig": srv.sign(TOKEN, "cmd", late)}],

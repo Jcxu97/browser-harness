@@ -81,6 +81,9 @@ async function pollLoop() {
   try {
     while (true) {
       try {
+        // An extension API call resets Chrome's 30 s idle timer, so the
+        // worker stays alive through the 25 s long poll.
+        await chrome.runtime.getPlatformInfo();
         await pollOnce();
       } catch (e) {
         await new Promise((r) => setTimeout(r, RETRY_MS));
@@ -97,11 +100,9 @@ async function execute(cmd) {
       const tab = await chrome.tabs.create({ url: cmd.url || "about:blank", windowId: cmd.windowId, active: false });
       return { tabId: tab.id, windowId: tab.windowId };
     }
-    case "create_window": {
-      // Always unfocused and minimized: the window goes straight to the taskbar.
-      const w = await chrome.windows.create({ url: cmd.url || "about:blank", focused: false, state: "minimized" });
-      return { ok: true, windowId: w.id, state: w.state };
-    }
+    // No create_window: with focused:false, chrome.windows.create shows the
+    // window inactive but not minimized, often on top of the user's app.
+    // BH opens its window with CDP instead.
     case "update_window": {
       // Used only to show the agent window for a login, and to hide it again.
       const info = {};

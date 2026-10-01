@@ -21,11 +21,12 @@ state file. The window that holds the anchor is the agent window. BH never
 guesses a window from tab counts or URLs. When the user closes the agent
 window, BH opens a new one on the next call.
 
-BH opens the window in this order:
-
-1. With the companion extension: `chrome.windows.create({focused: false, state: "minimized"})`.
-2. Without it: `Target.createTarget(newWindow=True, background=True, windowState="minimized")`,
-   then `Browser.setWindowBounds` with `windowState: "minimized"`.
+BH opens the window with `Target.createTarget(newWindow=True, background=True,
+windowState="minimized")`, then `Browser.setWindowBounds` with
+`windowState: "minimized"`. Chrome shows it inactive and minimizes it in the
+same step. BH does not use `chrome.windows.create({focused: false})`. With it,
+Chrome shows the window inactive but not minimized, often on top of the user's
+app.
 
 Agent tabs open with the extension (`chrome.tabs.create({windowId, active: false})`).
 Each new tab has a nonce in its start URL (`example.com/?bh-agent-tab=1&bh-nonce=...`),
@@ -38,7 +39,12 @@ and bring it to the front. So each new tab opens in a minimized window of its
 own (`Target.createTarget(newWindow=True, background=True, windowState="minimized")`).
 The record of the tab keeps that window id. BH treats the tab as an agent tab
 while it stays in that window, and closes the tab and its window when the
-process exits.
+process exits. Before it falls back, BH waits up to 35 seconds for an extension
+that polled in the last 2 minutes.
+
+Pages in agent tabs open links and `window.open()` in the same tab
+(`SAME_TAB_JS`). When a page opens a new tab, Chrome shows and activates its
+window, which would bring the minimized agent window over the user's app.
 
 ## Leases
 
@@ -147,7 +153,7 @@ Sheets), where DOM edits do not work.
 
 ## Companion extension
 
-The extension in `extension/` opens the window and the tabs without CDP. See
+The extension in `extension/` adds background tabs to the agent window. See
 `extension/README.md` for the install steps and the bridge security. Without
 the extension, BH uses the CDP way above.
 

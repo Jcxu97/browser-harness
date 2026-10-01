@@ -65,6 +65,12 @@ def server_is_up():
     return status == 200 and (data or {}).get("protocol") == 2
 
 
+def last_poll_age():
+    """Seconds since the extension last polled our server, or None."""
+    status, data = _status()
+    return (data or {}).get("last_poll_age_s") if status == 200 else None
+
+
 def _stop_legacy_server():
     """A server from before protocol 2 answers 401 to the new auth. It took the
     raw token from <config dir>/extension-bridge.token; use that to stop it."""

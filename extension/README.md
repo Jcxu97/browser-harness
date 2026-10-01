@@ -1,22 +1,24 @@
 # BH Companion Extension
 
-This optional Chrome extension lets `browser_harness.second_window` open its
-agent window and agent tabs without taking focus.
+This optional Chrome extension lets `browser_harness.second_window` add tabs
+to its minimized agent window without taking focus.
 
-1. `create_window` opens the agent window minimized and unfocused. The window
-   goes straight to the taskbar.
-2. `create_tab` opens a tab in that window with `active: false`.
+1. `create_tab` opens a tab in the agent window with `active: false`. Chrome
+   does not show or restore the window for a background tab.
+2. There is no `create_window`. With `focused: false`, `chrome.windows.create`
+   shows the window inactive but not minimized, often on top of the user's app.
+   BH opens the agent window with CDP (`Target.createTarget` with a background
+   new window, minimized).
 
-Without the extension, BH uses CDP (`Target.createTarget` with a background
-new window, then minimizes it). That works too, but the extension path is the
-quiet one.
+Without the extension, CDP cannot add a tab to the minimized window without
+focus. Each new agent tab then opens in a minimized window of its own.
 
 ## Install (one time)
 
 1. Open `chrome://extensions/`.
 2. Turn on **Developer mode**.
 3. Click **Load unpacked** and select this `extension/` folder.
-4. Make sure the card shows "Browser-Harness Companion" 0.5.0.
+4. Make sure the card shows "Browser-Harness Companion" 0.5.1.
 
 ## After an update
 

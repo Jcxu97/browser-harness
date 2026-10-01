@@ -27,7 +27,7 @@ class FakeBrowser:
         self.sessions = {}
         self.closed, self.clicks, self.bounds, self.activated = [], [], [], []
         self.keys = []
-        self.created, self.window_opens = [], []
+        self.created, self.window_opens, self.scripts = [], [], []
         self.ext_calls = []
         self.ax_nodes = []
         self._ids = itertools.count(1)
@@ -96,6 +96,9 @@ class FakeBrowser:
         if method == "Browser.setWindowBounds":
             self.bounds.append((p["windowId"], p["bounds"]))
             return {}
+        if method == "Page.addScriptToEvaluateOnNewDocument":
+            self.scripts.append((self.tab_of(session_id), p["source"]))
+            return {"identifier": "1"}
         tid = self.tab_of(session_id) if session_id else None
         page = self.pages.get(tid, {})
         if method == "Page.navigate":
@@ -157,7 +160,7 @@ def chrome(tmp_path, monkeypatch):
     monkeypatch.setattr(sw, "_raw_send", b.daemon)
     ext = types.SimpleNamespace(send_command=b.ext_send)
     b.ext = ext
-    monkeypatch.setattr(sw, "_extension", lambda wait=5.0: b.ext)
+    monkeypatch.setattr(sw, "_extension", lambda wait=5.0, patient=False: b.ext)
     monkeypatch.setattr(sw, "_owner_alive", lambda owner: True)
     monkeypatch.setattr(sw, "_pid_alive", lambda pid: pid in (os.getpid(), OTHER_PID))
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "me")
@@ -186,14 +189,21 @@ def test_window_is_never_guessed_from_content(chrome):
     lookalike = chrome.add_window([f"{sw.AGENT_SPAWN_URL}&bh-nonce=old"])
     wid = sw.ensure_agent_window()
     assert wid not in (USER_WID, lookalike)
-    assert chrome.ext_calls[0] == ("create_window", {
-        "url": chrome.pages[chrome.windows[wid][0]]["url"], "state": "minimized", "focused": False})
+
+
+def test_window_opens_with_cdp_minimized_and_in_the_background(chrome):
+    """chrome.windows.create with focused:false shows the window inactive but
+    not minimized, on top of the user's app (seen 2026-10-01)."""
+    wid = sw.ensure_agent_window()
+    assert chrome.created == [{"url": chrome.pages[chrome.windows[wid][0]]["url"], "newWindow": True,
+                               "background": True, "windowState": "minimized"}]
+    assert not chrome.ext_calls
 
 
 def test_window_is_reused_while_its_anchor_lives(chrome):
     wid = sw.ensure_agent_window()
     assert sw.ensure_agent_window() == wid
-    assert [c for c, _ in chrome.ext_calls].count("create_window") == 1
+    assert len(chrome.created) == 1
 
 
 def test_window_is_found_again_after_its_id_changes(chrome):
@@ -219,6 +229,13 @@ def test_new_tab_opens_in_the_agent_window_without_activation(chrome):
     assert chrome.window_of(tid) == wid
     action, params = chrome.ext_calls[-1]
     assert action == "create_tab" and params["windowId"] == wid and params["active"] is False
+
+
+def test_agent_tab_pages_keep_new_tabs_in_the_same_tab(chrome):
+    """A page that opens a tab makes Chrome show and activate the window."""
+    tid = sw.ensure_agent_tab()
+    sw._session_for(tid)
+    assert (tid, sw.SAME_TAB_JS) in chrome.scripts
 
 
 def test_cdp_fallback_tab_gets_a_minimized_window_of_its_own(chrome):
