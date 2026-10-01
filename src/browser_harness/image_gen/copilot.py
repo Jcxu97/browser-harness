@@ -1,7 +1,8 @@
 """M365 Copilot image generation driver via second-window agent tab.
 
 Hard rules (see memory feedback_m365_copilot_image_gen.md):
-1. Model must be switched to "GPT 5.5 深度思考" (default 自动 only returns text).
+1. Model must be switched to the GPT model that thinks deeper (default Auto
+   only returns text).
 2. Prompt must be prefixed with "生成图片：" (intent trigger).
 3. One prompt per call, no concurrent invocations.
 4. Each task gets a FRESH conversation (created from /chat). After success,
@@ -17,8 +18,8 @@ Pipeline:
 1. Find/reuse the single m365 tab in user's true secondary Chrome window.
 2. Navigate to /chat (always fresh conversation).
 3. Snapshot baseline designer iframes (rare leftover from sidebar preview).
-4. Open model selector → click GPT submenu → click "GPT 5.5 深度思考".
-5. Inject "生成图片：<prompt>" via CDP Input.insertText, click 发送.
+4. Open model selector → click GPT submenu → click the GPT item that thinks deeper.
+5. Inject "生成图片：<prompt>" via CDP Input.insertText, click Send.
 6. Capture the new conversation_id from URL after SPA pushes /conversation/<id>.
 7. Poll frame tree; for each Designer iframe, createIsolatedWorld, look for
    img[src^="data:image/"] with width≥512. Image rendering can take >2 min
@@ -33,6 +34,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -63,6 +65,9 @@ GRACE_AFTER_DONE = 120  # how long to keep polling without reload after the
                         # in-progress iframe hydration.
 POLL_INTERVAL = 4.0
 PROMPT_PREFIX = "生成图片："
+# The UI is Chinese or English, and the model name changes with each release
+# (GPT 5.5 深度思考 in 2026-05, GPT 5.6 Sol Think deeper in 2026-10).
+DEEP_GPT = re.compile(r"GPT.*(深度思考|think deeper)", re.I)
 
 
 # ---------- tab routing ----------
@@ -98,17 +103,17 @@ def _wait_selector(tid, check_expr, timeout=20):
 def _current_model_label(tid):
     return _eval(tid,
         """(([...document.querySelectorAll('button')]"""
-        """.find(b=>/模型选择/.test(b.getAttribute('aria-label')||'')))||{}).innerText"""
+        """.find(b=>/模型选择|model selector/i.test(b.getAttribute('aria-label')||'')))||{}).innerText"""
     )
 
 
-def _switch_to_gpt55_deep(tid):
-    """Switch model to 'GPT 5.5 深度思考'. Verifies the selector label changed."""
+def _switch_to_gpt_deep(tid):
+    """Switch to the GPT model that thinks deeper. Verifies the selector label changed."""
     # 1. Wait for the selector button to be visible (SPA hydrate).
     if not _wait_selector(
         tid,
         """(([...document.querySelectorAll('button')]"""
-        """.find(b => /模型选择/.test(b.getAttribute('aria-label')||'')))||{})"""
+        """.find(b => /模型选择|model selector/i.test(b.getAttribute('aria-label')||'')))||{})"""
         """.offsetParent !== undefined""",
         timeout=30,
     ):
@@ -116,15 +121,15 @@ def _switch_to_gpt55_deep(tid):
     # Extra hydrate buffer — selector may be in DOM but not interactive yet.
     time.sleep(1.5)
 
-    # If already on GPT 5.5 (idempotent reuse), skip.
+    # If already on it (idempotent reuse), skip.
     label = _current_model_label(tid) or ""
-    if "GPT 5.5" in label:
+    if DEEP_GPT.search(label):
         return
 
     # 2. Click model selector to open menu.
     _eval(tid,
         """(()=>{const s=[...document.querySelectorAll('button')]"""
-        """.find(b=>/模型选择/.test(b.getAttribute('aria-label')||''));"""
+        """.find(b=>/模型选择|model selector/i.test(b.getAttribute('aria-label')||''));"""
         """if(s)s.click();})()"""
     )
     # Wait for the menu to render (look for the GPT submenu trigger).
@@ -152,30 +157,30 @@ def _switch_to_gpt55_deep(tid):
         tid,
         r"""!![...document.querySelectorAll('[role="menuitemradio"]')]"""
         r""".filter(x=>x.offsetParent!==null)"""
-        r""".find(x=>/GPT 5\.5 深度思考/.test((x.innerText||'').trim()))""",
+        r""".find(x=>/GPT.*(深度思考|think deeper)/i.test((x.innerText||'').trim()))""",
         timeout=8,
     ):
-        raise RuntimeError("'GPT 5.5 深度思考' menuitem never appeared")
+        raise RuntimeError("the GPT menu item that thinks deeper never appeared")
 
-    # 4. Click 'GPT 5.5 深度思考'.
+    # 4. Click the GPT item that thinks deeper.
     ok = _eval(tid,
         r"""JSON.stringify((()=>{const it=[...document.querySelectorAll('[role="menuitemradio"]')]"""
         r""".filter(x=>x.offsetParent!==null)"""
-        r""".find(x=>/GPT 5\.5 深度思考/.test((x.innerText||'').trim()));"""
+        r""".find(x=>/GPT.*(深度思考|think deeper)/i.test((x.innerText||'').trim()));"""
         r"""if(!it)return false;it.click();return true;})())"""
     )
     if ok != "true":
-        raise RuntimeError("'GPT 5.5 深度思考' click failed")
+        raise RuntimeError("click on the GPT item that thinks deeper failed")
 
     # 5. Verify label changed AND stabilized (SPA can flicker label briefly to
     # the picked option, then revert if click didn't register on the right item).
-    # Require 3 consecutive observations of "GPT 5.5" separated by 0.5s.
+    # Require 3 consecutive observations of the model separated by 0.5s.
     deadline = time.time() + 8
     streak = 0
     label = ""
     while time.time() < deadline:
         label = _current_model_label(tid) or ""
-        if "GPT 5.5" in label:
+        if DEEP_GPT.search(label):
             streak += 1
             if streak >= 3:
                 return
@@ -183,21 +188,21 @@ def _switch_to_gpt55_deep(tid):
             streak = 0
         time.sleep(0.5)
     raise RuntimeError(
-        f"model label did not stabilize on GPT 5.5 (last seen {label!r}, "
+        f"model label did not stabilize on the deep GPT model (last seen {label!r}, "
         f"streak={streak}) — menu click likely selected a different item"
     )
 
 
 def _inject_and_send(tid, prompt):
     # Re-verify model right before send — selector can silently revert to "自动"
-    # between _switch_to_gpt55_deep and now (SPA hydrate races, focus shifts).
+    # between _switch_to_gpt_deep and now (SPA hydrate races, focus shifts).
     # 自动 model returns text-only, never spawns Designer iframe → 240s timeout.
     label = _current_model_label(tid) or ""
-    if "GPT 5.5" not in label:
+    if not DEEP_GPT.search(label):
         # One more switch attempt before failing.
-        _switch_to_gpt55_deep(tid)
+        _switch_to_gpt_deep(tid)
         label = _current_model_label(tid) or ""
-        if "GPT 5.5" not in label:
+        if not DEEP_GPT.search(label):
             raise RuntimeError(
                 f"model reverted to {label!r} before send and re-switch failed"
             )
@@ -215,7 +220,7 @@ def _inject_and_send(tid, prompt):
     time.sleep(0.5)
     sent = _eval(tid,
         """JSON.stringify((()=>{const s=[...document.querySelectorAll('button')]"""
-        """.find(b=>b.getAttribute('aria-label')==='发送'&&!b.disabled);"""
+        """.find(b=>['发送','Send'].includes(b.getAttribute('aria-label'))&&!b.disabled);"""
         """if(!s)return false;s.click();return true;})())"""
     )
     if sent != "true":
@@ -590,7 +595,7 @@ def generate(prompt, save_dir, max_retry=0):
     navigate_agent(tid, NEW_CHAT_URL)
     time.sleep(8.0)  # SPA hydrate
     baseline = _collect_designer_baseline(tid)
-    _switch_to_gpt55_deep(tid)
+    _switch_to_gpt_deep(tid)
     _inject_and_send(tid, full_prompt)
     _, png_bytes = _wait_for_new_image(tid, baseline)
     out_path = save_dir_p / "image_0.png"
