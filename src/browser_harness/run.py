@@ -405,32 +405,16 @@ def _run(args):
             # Setup/permission errors are instructions for calling agent
             print(f"browser-harness: {e}", file=sys.stderr)
             sys.exit(1)
-    # ORDER IS LOAD-BEARING (2026-07-27 merge of upstream v0.1.8):
-    # _install_helper_trace() walks dir(helpers) and rewrites globals() with
-    # tracing wrappers — including new_tab / goto_url, which `from .helpers
-    # import *` already put there. Running it AFTER safe_globals() would undo
-    # bootstrap's _legacy_new_tab / _legacy_goto_url shadowing and hand the
-    # agent raw APIs that operate on the user's main window. Trace first,
-    # then let safe-mode shadow the dangerous names last.
+    # Trace first: _install_helper_trace() rewrites every helper name in
+    # globals(), so running it after safe_globals() would put the upstream
+    # new_tab / close_tab back over the safe-mode versions.
     _install_helper_trace()
-    # PreExec hook: bind a pinned second window + shadow dangerous old API names
-    # (new_tab, goto_url) so agent-written stdin can't accidentally pollute the
-    # user's main window. Disable with BH_SAFE_MODE=0 if you really need raw
-    # helpers (no current task does).
-    # Under pytest there is no live daemon or Chrome, and upstream's tests drive
-    # main() with mocked argv/stdin. Binding a real second window there fails with
-    # FileNotFoundError on the .port file (9 upstream test_run cases). Detect the
-    # test harness by its own import rather than adding an env switch — the
-    # existing BH_SAFE_MODE=0 escape is blocked by a user hook precisely so it
-    # can't be used to route helpers at the focused window.
+    # Safe mode: helpers._send already routes every request through
+    # second_window.request_policy. safe_globals() binds this process's agent tab
+    # and adds the fork's short helper names. Under pytest there is no Chrome,
+    # and upstream's tests drive main() with mocked argv/stdin.
     _under_pytest = "pytest" in sys.modules
     if os.environ.get("BH_SAFE_MODE", "1") != "0" and not _under_pytest:
-        # Bootstrap binds the safe API (goto/eval_js/snap/...). If it fails and we
-        # silently fall through to exec(), user code that calls goto(...) hits
-        # NameError instead of seeing the real cause (bootstrap raised because of
-        # e.g. a CDP WS handshake timeout under concurrent load). Raise loudly
-        # so the user sees the real failure and can retry. Disable with
-        # BH_SAFE_MODE=0 if a task genuinely needs raw helpers (none currently do).
         from .bootstrap import safe_globals
         globals().update(safe_globals())
     exec(code, globals())

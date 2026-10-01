@@ -35,11 +35,12 @@ import json
 import os
 import shutil
 import time
-import uuid
 from pathlib import Path
 
-from ..helpers import cdp, list_tabs
-from ..second_window import _attach, _detach, _record_access, navigate_agent
+from ..helpers import cdp
+from ..second_window import (
+    _attach, _detach, close_agent_tabs_matching, ensure_agent_tab, navigate_agent,
+)
 
 # Strategy 2026-05-20 (per user direction):
 # Each generate() call creates a FRESH conversation, then deletes the
@@ -62,112 +63,16 @@ GRACE_AFTER_DONE = 120  # how long to keep polling without reload after the
                         # in-progress iframe hydration.
 POLL_INTERVAL = 4.0
 PROMPT_PREFIX = "生成图片："
-MAIN_MARKERS = (
-    "bilibili.com", "youtube.com", "douyin.com", "qq.com",
-    "wegame", "google.com/search", "127.0.0.1",
-)
 
 
-# ---------- window routing (work around heuristic bug) ----------
-
-def _detect_windows():
-    """Return (main_wid, secondary_wid, secondary_tabs).
-
-    Content-based: window containing a tab whose URL matches MAIN_MARKERS = main.
-    Falls back to tab-count heuristic if no content match.
-    """
-    by_win = {}
-    for t in list_tabs():
-        tid = t.get("targetId")
-        url = (t.get("url") or "").lower()
-        try:
-            wid = cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
-        except Exception:
-            continue
-        by_win.setdefault(wid, []).append((tid, url))
-    if not by_win:
-        raise RuntimeError("no chrome windows found")
-    if len(by_win) == 1:
-        wid = next(iter(by_win))
-        return wid, wid, by_win[wid]
-    main = None
-    for wid, ts in by_win.items():
-        if any(any(m in url for m in MAIN_MARKERS) for _, url in ts):
-            main = wid
-            break
-    if main is None:
-        sorted_w = sorted(by_win.items(), key=lambda kv: len(kv[1]))
-        return sorted_w[-1][0], sorted_w[0][0], sorted_w[0][1]
-    secondary = next(w for w in by_win if w != main)
-    return main, secondary, by_win[secondary]
-
+# ---------- tab routing ----------
 
 def _force_agent_tab_in_secondary():
-    """Find or spawn an agent tab in the true secondary window.
-
-    Tab-reuse priority (CRITICAL — see memory feedback_m365_copilot_one_tab.md):
-    1. Existing m365.cloud.microsoft tab → reuse (after navigate, the
-       bh-agent-tab marker is gone but the tab is still our agent)
-    2. Existing bh-agent-tab marker tab → reuse (fresh seed not yet navigated)
-    3. None of the above → spawn new (only on the very first call)
-
-    Multiple m365 tabs accumulating breaks Copilot generation (silent fail
-    on backend due to context confusion / concurrency guard).
-    """
-    main_wid, sec_wid, sec_tabs = _detect_windows()
-
-    # Priority 1: existing m365 tab (already-navigated agent tab)
-    m365_tids = [tid for tid, url in sec_tabs if "m365.cloud.microsoft" in url]
-    if m365_tids:
-        # If somehow we have multiple m365 tabs in secondary, close extras —
-        # keep only the first (oldest, has conversation context).
-        keeper = m365_tids[0]
-        for extra in m365_tids[1:]:
-            try:
-                cdp("Target.closeTarget", targetId=extra)
-            except Exception:
-                pass
-        _record_access(keeper, claim=True)
-        return keeper
-
-    # Priority 2: bh-agent-tab marker (freshly seeded, not yet navigated)
-    for tid, url in sec_tabs:
-        if "bh-agent-tab" in url:
-            _record_access(tid, claim=True)
-            return tid
-
-    # Priority 3: spawn (first-time only)
-    if not sec_tabs:
-        raise RuntimeError("secondary window has no tabs to seed from")
-    seed_tid = sec_tabs[0][0]
-    nonce = f"{os.getpid()}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-    spawn_url = f"https://example.com/?bh-agent-tab=1&bh-nonce={nonce}"
-    sid = _attach(seed_tid)
-    try:
-        cdp("Runtime.evaluate", session_id=sid,
-            expression=f"window.open({json.dumps(spawn_url)}, '_blank', 'noopener')",
-            userGesture=True)
-    finally:
-        _detach(sid)
-    time.sleep(1.2)
-    new_tid = None
-    for _ in range(12):
-        for t in cdp("Target.getTargets").get("targetInfos", []):
-            if t.get("type") == "page" and nonce in (t.get("url") or ""):
-                new_tid = t.get("targetId")
-                break
-        if new_tid:
-            break
-        time.sleep(0.4)
-    if not new_tid:
-        raise RuntimeError("agent tab spawn failed (popup blocked?)")
-    actual_wid = cdp("Browser.getWindowForTarget", targetId=new_tid).get("windowId")
-    if actual_wid != sec_wid:
-        raise RuntimeError(
-            f"agent tab landed in wrong window {actual_wid} != secondary {sec_wid}"
-        )
-    _record_access(new_tid, claim=True)
-    return new_tid
+    """Lease the agent tab for Copilot. Several m365 tabs break generation, so
+    reuse an existing one and close the extra ones."""
+    tid = ensure_agent_tab(prefer_url="m365.cloud.microsoft")
+    close_agent_tabs_matching("m365.cloud.microsoft", keep=tid)
+    return tid
 
 
 # ---------- top-frame helpers ----------

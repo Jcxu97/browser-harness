@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, time, urllib.request
+import base64, importlib.util, json, math, os, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -60,7 +60,25 @@ class _IPCResponseTimeout(TimeoutError):
     pass
 
 
+# Safe mode puts second_window.request_policy here (see the end of this file).
+_REQUEST_POLICY = None
+
+
 def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+    if _REQUEST_POLICY is None:
+        return _raw_send(req, response_timeout)
+    return _REQUEST_POLICY(req, lambda r: _raw_send(r, response_timeout))
+
+
+def _raw_cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
+    """cdp() without the safe-mode policy. Only second_window uses it."""
+    return _raw_send(
+        {"method": method, "params": params, "session_id": session_id},
+        response_timeout=_response_timeout,
+    ).get("result", {})
+
+
+def _raw_send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
     c, token = ipc.connect(NAME, timeout=IPC_CONNECT_TIMEOUT_SECONDS)
     try:
         c.settimeout(response_timeout)
@@ -676,4 +694,15 @@ def _load_agent_helpers():
         globals()[name] = value
 
 
+def _install_safe_mode():
+    # Upstream's unit tests drive these helpers against a fake daemon; they
+    # must see the raw behavior.
+    if os.environ.get("BH_SAFE_MODE", "1") == "0" or "pytest" in sys.modules:
+        return
+    from . import second_window
+    global _REQUEST_POLICY
+    _REQUEST_POLICY = second_window.request_policy
+
+
+_install_safe_mode()
 _load_agent_helpers()

@@ -1,127 +1,71 @@
-"""
-Second-window-respecting agent tab management.
+"""Agent tabs in a Chrome window that BH owns.
 
-Hard rule: agent tabs MUST live in the user's existing second Chrome window,
-spawned via window.open from an existing tab in that window — NEVER abuse
-Target.createTarget which lands in active window or steals focus.
+BH creates one minimized window in the user's Chrome (through the companion
+extension) and keeps every agent tab in it. The agent window is the window
+that holds the anchor tab with our window nonce in its URL. BH never picks a
+window by looking at the user's content.
+
+Each process leases the tab it works on, so two processes never drive the
+same tab. Later calls from the same Claude session reuse that session's tabs.
+
+In safe mode (the default), helpers._send runs every request through
+request_policy(). A page-level CDP call without a session goes to the agent
+tab of this process. A call that would create, focus or close a tab outside
+the agent window is refused.
 
 Key APIs:
-    ensure_agent_tab()             # auto-detect + auto-spawn + persistent reuse
+    ensure_agent_tab()                  lease an agent tab for this process
+    bound_tab()                         the tab that session-less calls use
     navigate_agent(tid, url)
-    snapshot_agent(tid)            # innerText
-    screenshot_agent(tid, path)
-    save_as_pdf_agent(tid, path)
+    snapshot_agent(tid)                 innerText
+    snapshot_tree_agent(tid)            accessibility tree with @e refs
+    click_ref_agent(tid, "@e3") / fill_ref_agent(tid, "@e5", "text")
+    screenshot_agent(tid, path) / save_as_pdf_agent(tid, path)
     evaluate_agent(tid, expr)
-    fill_agent(tid, selector, value)
-    click_at_agent(tid, x, y)      # alias: mouse_click_agent
-    key_type_agent(tid, text)
-    send_keys_agent(tid, [keys])   # independent key presses, NO held modifiers
-    hotkey_agent(tid, "Ctrl+End")  # real modifier chord (Ctrl/Shift/Alt/Meta)
-    upload_agent(tid, selector, [file_paths])
-    list_agent_tabs()
-    find_agent_tab(url_substring)
-    close_agent_tab(tid)
-    prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS)   # 15; backstop, not primary GC
-
-Internal:
-    detect_second_window()         # pin > extension focused flag > content scoring
-    spawn_second_window()          # chrome.exe --new-window (steals focus once)
-
-Optional acceleration: if `bh_extension_client.is_available()` is True (the
-companion Chrome extension is installed and connected), spawn goes through
-chrome.tabs.create({active:false, windowId:X}) for ZERO focus steal. Fallback
-is the CDP `window.open` path with focus-restore mitigation.
+    click_at_agent / key_type_agent / send_keys_agent / hotkey_agent
+    fill_agent(tid, selector, value) / upload_agent(tid, selector, paths)
+    new_agent_tab(url) / list_agent_tabs() / find_agent_tab(s) / close_agent_tab(tid)
+    show_window() / hide_window()       only for a login the user must type
 """
 
-import json, time, pathlib, subprocess, base64, os, sys, threading, contextlib
-from collections import defaultdict
+import base64, contextlib, json, os, pathlib, sys, time, uuid
 
-from .helpers import cdp
+from .helpers import _raw_cdp as cdp, _raw_send
 
-
-# ---------- config ----------
 
 STATE_DIR = pathlib.Path.home() / ".browser-harness"
-STATE_DIR.mkdir(exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "second-window-state.json"
-
-# Domain fingerprints — last-resort heuristic used only when neither pin nor
-# extension `focused=True` give an authoritative answer. A window containing
-# ANY user-domain URL is treated as the user's main window — agent tabs MUST
-# NOT spawn there, even if it has more "work" tabs by count.
-USER_DOMAINS = (
-    "bilibili.com", "youtube.com", "douyin.com", "huya.com",
-    "twitch.tv", "weibo.com", "qq.com/", "wegame",
-    "google.com/search", "baidu.com", "zhihu.com",
-    "twitter.com/home", "x.com/home",
-    "/maps", "tieba.baidu",
-    # User's daily-use admin/management surfaces (user told 2026-05-21):
-    "127.0.0.1:8090/admin",  # sub2api admin panel — user opens it on main browser
-    "localhost:8090/admin",
-    # Same panel over Tailscale — this is the form the user actually opens
-    # (2026-07-30: only the loopback forms were listed, so a detect pass scored
-    # the main window as non-user and a tab got inserted there. The whole
-    # 100.64.0.0/10 CGNAT range is private infrastructure, never agent work.)
-    ":8090/admin",
-    "100.86.104.62",
-)
-WORK_DOMAINS = (
-    "nexusmods.com", "doubao.com/chat", "m365.cloud.microsoft",
-    "chat.openai.com", "claude.ai/", "kimi.com", "kimi.moonshot",
-    "example.com/?bh-agent-tab",  # our own marker
-    # Note: NOT "127.0.0.1:" — that's user's admin endpoints; see USER_DOMAINS.
-)
-
-# Locate chrome.exe (Windows). Override via BH_CHROME_EXE env var if needed.
-def _find_chrome_exe():
-    env = os.environ.get("BH_CHROME_EXE")
-    if env and pathlib.Path(env).exists():
-        return env
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]
-    for c in candidates:
-        if pathlib.Path(c).exists():
-            return c
-    return None
-
-CHROME_EXE = _find_chrome_exe()
+REF_DIR = STATE_DIR / "refs"
 
 AGENT_TAB_MARKER = "bh-agent-tab"
 AGENT_SPAWN_URL = f"https://example.com/?{AGENT_TAB_MARKER}=1"
-DEFAULT_MAX_AGENT_TABS = 15  # cap chosen by user 2026-05-24 (was 25) — atexit placeholder cleanup means cap is now a backstop, not the primary GC
+AGENT_WINDOW_KEY = "bh-agent-window"
+DEFAULT_MAX_AGENT_TABS = 15
+# A lease is void when its holder is dead or idle this long. The idle limit
+# covers PID reuse.
+LEASE_IDLE_SECONDS = 1800
+PLACEHOLDER_REAP_AGE_SECONDS = 60
 SPAWN_FOCUS_WARNING = (
-    "[bh.second_window] No second window detected. "
-    "Spawning chrome --new-window (OS will steal focus once — unavoidable)."
+    "[bh.second_window] The companion extension is not connected. Using the "
+    "CDP fallback: Chrome can flash once in the taskbar."
 )
 
 
-# ---------- state ----------
+# ---------- state file ----------
 
 def _load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {"agent_tabs": []}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"agent_tabs": []}
 
 
 def _save_state(s):
-    """Atomic write: tmp + os.replace so concurrent readers never see a torn file.
-
-    Windows quirk: os.replace can hit ERROR_ACCESS_DENIED if any other process
-    holds a handle on STATE_FILE — e.g. a concurrent reader/writer that just
-    opened it. On Linux this is fine (rename always succeeds), on Windows it
-    isn't. Retry with short backoff; we're already inside _state_mutex on the
-    write paths so we own logical exclusivity, but the OS-level handle race
-    still exists for unsynchronized readers (e.g. _load_state called outside
-    the mutex). 4-parallel soak hit this 2/800 = 0.25% before the retry.
-    """
+    """Write tmp, then os.replace. Retry, because on Windows a reader's open
+    handle makes os.replace fail with ERROR_ACCESS_DENIED."""
     tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(s, indent=2))
+    tmp.write_text(json.dumps(s, indent=2), encoding="utf-8")
     last_err = None
     for delay in (0, 0.05, 0.1, 0.2, 0.4):
         if delay:
@@ -131,7 +75,6 @@ def _save_state(s):
             return
         except PermissionError as e:
             last_err = e
-    # All retries exhausted — clean up tmp and re-raise so caller sees the failure
     try:
         tmp.unlink()
     except Exception:
@@ -139,135 +82,59 @@ def _save_state(s):
     raise last_err
 
 
+# ---------- cross-process locks ----------
+
 _STATE_LOCK_PATH = STATE_DIR / "second-window-state.lock"
-
-
-@contextlib.contextmanager
-def _state_mutex(timeout=15.0):
-    """Cross-process file-lock for STATE read-modify-write.
-
-    Without this, N parallel BH processes each do load→mutate→save concurrently
-    and lose-update each other's records. The TABS still exist in CDP but their
-    STATE records vanish — orphans that prune_agent_tabs can't see, so the
-    DEFAULT_MAX_AGENT_TABS cap silently leaks (3-parallel verify 2026-05-24:
-    STATE.agent_tabs=14 but actual second-window tab count=29).
-
-    Stale lock (mtime > 30s) is reaped — holder probably crashed mid-RMW.
-    """
-    deadline = time.time() + timeout
-    while True:
-        try:
-            fd = os.open(str(_STATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, f"{os.getpid()}\n{time.time()}".encode())
-            finally:
-                os.close(fd)
-            break
-        except FileExistsError:
-            try:
-                age = time.time() - _STATE_LOCK_PATH.stat().st_mtime
-            except FileNotFoundError:
-                age = 0  # released — retry immediately
-                time.sleep(0.005)
-                continue
-            # Only steal a lock whose holder is provably gone.
-            #
-            # 2026-07-30: this used to reap on age alone. The pid was written
-            # into the file but never read back, so a holder that was merely
-            # SLOW (cold home-directory IO, suspended process, resume from
-            # sleep) got its lock yanked while still inside the critical
-            # section — mutual exclusion silently off. _gc_orphan_claims can
-            # legitimately run tens of seconds: it calls _owner_alive per
-            # record, and each of those may walk ~/.claude/projects and hit
-            # OpenProcess.
-            if age > 30 and not _lock_holder_alive(_STATE_LOCK_PATH):
-                try: _STATE_LOCK_PATH.unlink()
-                except FileNotFoundError: pass
-                continue  # retry the create
-            if time.time() >= deadline:
-                raise RuntimeError(f"STATE mutex held > {timeout}s")
-            time.sleep(0.02)
-    try:
-        yield
-    finally:
-        # Release only if the file still carries OUR pid. An unconditional
-        # unlink would delete a lock that a reaper already reassigned to
-        # another process, letting a third one in while the second is still
-        # inside its critical section.
-        _release_lock_if_mine(_STATE_LOCK_PATH)
+_SPAWN_LOCK_PATH = STATE_DIR / "second-window-spawn.lock"
 
 
 def _pid_alive(pid):
-    """Is this PID still running? Returns True when we cannot tell.
+    """Is this PID running? Returns True when we cannot tell.
 
-    Being wrong in the "it's dead" direction is the expensive one: callers use
-    this to decide whether to steal a lock or reclaim another session's tab, so
-    a false "dead" means breaking a live session. A false "alive" only costs a
-    wait or a leaked record.
-
-    2026-07-30: the docstring already promised conservative-on-uncertainty but
-    every failure path returned False, including OpenProcess denials — a live
-    process running at a different integrity level or under another user reads
-    as dead. Now only an explicit "no such process" answer counts as dead.
+    A false "dead" breaks a live session (a stolen lock or tab). A false
+    "alive" only costs a wait or one extra tab. Only an explicit "no such
+    process" answer counts as dead.
     """
     if not pid:
         return False
     try:
         if os.name == "nt":
-            # tasklist is slow; use Windows API via ctypes
             import ctypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             STILL_ACTIVE = 259
-            ERROR_INVALID_PARAMETER = 87  # what OpenProcess reports for a dead pid
-            ctypes.windll.kernel32.SetLastError(0)
-            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            ERROR_INVALID_PARAMETER = 87  # OpenProcess on a pid that does not exist
+            k32 = ctypes.windll.kernel32
+            k32.SetLastError(0)
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
-                # ERROR_INVALID_PARAMETER == the pid genuinely doesn't exist.
-                # ERROR_ACCESS_DENIED (5) and friends mean it DOES exist but we
-                # may not look at it, so treat those as alive.
-                return ctypes.windll.kernel32.GetLastError() != ERROR_INVALID_PARAMETER
+                return k32.GetLastError() != ERROR_INVALID_PARAMETER
             try:
                 code = ctypes.c_ulong()
-                ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-                if not ok:
-                    return True  # can't read exit code — assume alive
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return True
                 return code.value == STILL_ACTIVE
             finally:
-                ctypes.windll.kernel32.CloseHandle(h)
-        else:
-            try:
-                os.kill(pid, 0)
-                return True
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists, owned by someone else
+                k32.CloseHandle(h)
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
     except Exception:
-        return True  # unknown → conservative
+        return True
 
 
-# ---------- owner identity (per-Claude-session, not per-PID) ----------
-#
-# Why session-id beats PID: each Bash/Python heredoc fired from a Claude
-# session is a fresh short-lived process. Per-PID claims die with the
-# heredoc, so the "orphan adoption" path lets the NEXT heredoc — which can
-# belong to a *different* Claude session — grab the previous tab. That's
 def _lock_pid(lock_path):
-    """PID recorded in a lock file, or None if unreadable/malformed."""
     try:
-        first = lock_path.read_text(encoding="utf-8").splitlines()[0].strip()
-        return int(first)
+        return int(lock_path.read_text(encoding="utf-8").splitlines()[0].strip())
     except Exception:
         return None
 
 
 def _lock_holder_alive(lock_path):
-    """Is the process that wrote this lock file still running?
-
-    Unreadable or malformed lock file → True (don't steal what we can't verify;
-    the age check already gates this, and a genuinely abandoned unreadable lock
-    is the rarer failure than a live holder we misread).
-    """
+    """Unreadable or malformed lock file counts as held."""
     pid = _lock_pid(lock_path)
     if pid is None:
         return True
@@ -275,28 +142,60 @@ def _lock_holder_alive(lock_path):
 
 
 def _release_lock_if_mine(lock_path):
-    """Delete a lock file only when it still records our own PID."""
     pid = _lock_pid(lock_path)
     if pid is not None and pid != os.getpid():
-        return  # a reaper handed it to someone else; leave theirs alone
+        return
     try:
         lock_path.unlink()
-    except FileNotFoundError:
-        pass
     except Exception:
         pass
 
 
-# exactly the cross-session hijack we hit 2026-05-24 (Nexus upload tab kept
-# getting navigated to baidu pan / asus armoury crate by a parallel
-# session's exe-downloader). CLAUDE_CODE_SESSION_ID is set by Claude Code
-# and inherited by all child processes — gives us stable per-session
-# ownership that survives heredoc churn.
+@contextlib.contextmanager
+def _file_lock(lock_path, timeout, stale_after=30.0):
+    """O_EXCL lock file. Take over a lock only when it is older than
+    stale_after AND its holder is dead: a slow holder is not a dead one."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n{time.time()}".encode())
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age > stale_after and not _lock_holder_alive(lock_path):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                raise RuntimeError(f"{lock_path.name} held for more than {timeout}s")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        _release_lock_if_mine(lock_path)
+
+
+def _state_mutex(timeout=15.0):
+    return _file_lock(_STATE_LOCK_PATH, timeout)
+
+
+# ---------- owner identity and leases ----------
+#
+# claimed_by = the Claude session (or pid outside Claude). It gives continuity:
+# the next heredoc of the same session gets its old tab back.
+# lease_pid = the process that drives the tab now. Subagents inherit the
+# session id, so the lease is what keeps two parallel processes apart.
 
 def _get_owner_id():
-    """Stable identity for claim ownership. Prefers Claude Code's session ID
-    (long-lived across all child processes of one Claude session). Falls
-    back to PID for non-Claude callers (manual scripts, tests)."""
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if sid:
         return f"session:{sid}"
@@ -304,10 +203,8 @@ def _get_owner_id():
 
 
 def _owner_alive(owner):
-    """Is the owner of this claim still active? Generic over session/pid."""
     if not owner:
         return False
-    # Legacy: integer claimed_by_pid from old state files
     if isinstance(owner, int):
         return _pid_alive(owner)
     if not isinstance(owner, str):
@@ -318,41 +215,31 @@ def _owner_alive(owner):
         except ValueError:
             return False
     if owner.startswith("session:"):
+        # A session is alive while its transcript changed in the last 6 hours.
         sid = owner[8:]
-        # A Claude session is "alive" if its transcript jsonl was modified
-        # recently. Path: ~/.claude/projects/<encoded-cwd>/<sid>.jsonl.
-        # Idle sessions stay open for hours during multi-day work, so use
-        # a generous TTL — the cost of keeping a stale claim is bounded
-        # (one tab not adopted), the cost of dropping a live claim is
-        # cross-session hijack which is much worse.
         try:
             projects = pathlib.Path.home() / ".claude" / "projects"
             if not projects.exists():
-                return True  # can't verify — be conservative
+                return True
             for proj in projects.iterdir():
                 jsonl = proj / f"{sid}.jsonl"
                 if jsonl.exists():
-                    age = time.time() - jsonl.stat().st_mtime
-                    return age < 6 * 3600  # 6h idle TTL
-            return False  # session not found in any project
+                    return time.time() - jsonl.stat().st_mtime < 6 * 3600
+            return False
         except Exception:
             return True
     return False
 
 
 def _read_claim(record):
-    """Extract owner identity from a state record, with legacy fallback."""
     v = record.get("claimed_by")
     if v:
         return v
     pid = record.get("claimed_by_pid")
-    if pid:
-        return f"pid:{pid}"
-    return None
+    return f"pid:{pid}" if pid else None
 
 
 def _write_claim(record, owner):
-    """Set owner on a state record (and migrate legacy claimed_by_pid)."""
     record["claimed_by"] = owner
     record.pop("claimed_by_pid", None)
 
@@ -362,606 +249,199 @@ def _clear_claim(record):
     record.pop("claimed_by_pid", None)
 
 
-def _record_access(tid, claim=False, nonce=None):
-    """Update last_access for tid. If claim=True, also claim it for self owner.
-
-    `nonce` is the unique tag baked into the spawn URL (see I05 fix —
-    bootstrap atexit needs this to distinguish a still-on-placeholder tab
-    from a tab the agent navigated to a URL that happens to contain the
-    AGENT_TAB_MARKER substring). Only set on first record (initial spawn);
-    subsequent _record_access calls preserve the original nonce.
-    """
-    my_owner = _get_owner_id()
-    with _state_mutex():
-        state = _load_state()
-        tabs = state.get("agent_tabs", [])
-        for r in tabs:
-            if r["tid"] == tid:
-                r["last_access"] = time.time()
-                if claim:
-                    _write_claim(r, my_owner)
-                if nonce and not r.get("nonce"):
-                    r["nonce"] = nonce
-                _save_state(state)
-                return
-        rec = {"tid": tid, "last_access": time.time()}
-        if claim:
-            _write_claim(rec, my_owner)
-        if nonce:
-            rec["nonce"] = nonce
-        tabs.append(rec)
-        state["agent_tabs"] = tabs
-        _save_state(state)
-
-
 def _gc_orphan_claims(state):
-    """Mutate state in place: drop claim for dead owners (mark orphan)."""
     for r in state.get("agent_tabs", []):
         owner = _read_claim(r)
         if owner and not _owner_alive(owner):
             _clear_claim(r)
 
 
-# ---------- CDP attach helpers (no focus steal) ----------
+def _lease_busy(record, now=None):
+    """Is another live process driving this tab?"""
+    pid = record.get("lease_pid")
+    if not pid or pid == os.getpid():
+        return False
+    if (now or time.time()) - record.get("last_access", 0) > LEASE_IDLE_SECONDS:
+        return False
+    return _pid_alive(pid)
+
+
+def _take(record, owner):
+    _write_claim(record, owner)
+    record["lease_pid"] = os.getpid()
+    record["last_access"] = time.time()
+
+
+def _record_access(tid, claim=False, nonce=None):
+    """Update last_access of tid. claim=True also claims and leases it."""
+    owner = _get_owner_id()
+    with _state_mutex():
+        state = _load_state()
+        tabs = state.setdefault("agent_tabs", [])
+        rec = next((r for r in tabs if r.get("tid") == tid), None)
+        if rec is None:
+            rec = {"tid": tid, "created_at": time.time()}
+            tabs.append(rec)
+        rec["last_access"] = time.time()
+        if claim:
+            _take(rec, owner)
+        if nonce and not rec.get("nonce"):
+            rec["nonce"] = nonce
+        _save_state(state)
+
+
+_LAST_TOUCH = {}
+
+
+def _touch(tid):
+    """Throttled _record_access: at most one state write per tab every 10s."""
+    now = time.time()
+    if now - _LAST_TOUCH.get(tid, 0) < 10:
+        return
+    _LAST_TOUCH[tid] = now
+    try:
+        _record_access(tid)
+    except Exception:
+        pass
+
+
+# ---------- CDP basics ----------
 
 def _attach(tid):
     return cdp("Target.attachToTarget", targetId=tid, flatten=True).get("sessionId")
 
 
 def _detach(sid):
-    try: cdp("Target.detachFromTarget", sessionId=sid)
-    except Exception: pass
-
-
-# ---------- focus-steal mitigation ----------
-
-# REMOVED 2026-07-30: _detect_main_window()
-#
-# No callers. Its fallback was `max(windows, key=tab_count)` — the tab-count
-# heuristic whose own docstring admitted it is wrong when the second window has
-# more tabs than the main one, which is precisely the 2026-05-20 incident.
-# detect_second_window() below already declares that heuristic dead; leaving a
-# live copy of it in the file only invited someone to reach for it.
-#
-# For "which window is the user's", use the extension's focused flag
-# (_capture_user_main_window) and treat unavailability as a hard stop, not as
-# licence to guess.
-
-
-def _capture_user_main_window():
-    """Snapshot the user's currently-focused window + its active tab BEFORE
-    a BH spawn touches Chrome. Pair with _smart_focus_main_window(snapshot)
-    AFTER the spawn to restore foreground without changing the active tab.
-
-    Returns {window_id, tab_url, tab_title} or None if extension is offline
-    or the user is in a non-Chrome app (focused=false on every window).
-
-    Why a snapshot: Chrome's spawn (--new-window subprocess, or even some
-    extension-driven flows under load) briefly raises the new window. After
-    that, "currently focused window" momentarily IS the second window — so
-    we can't read it post-hoc. Capture pre-spawn while the truth is still
-    the user's main window.
-    """
     try:
-        from . import bh_extension_client as ext
-        if not ext.is_available():
-            return None
-        wins = ext.send_command("list_windows", timeout=2)
-        if not wins:
-            return None
-        focused = next((w for w in wins if w.get("focused")), None)
-        if not focused:
-            return None  # user is in another app — don't yank Chrome to front
-        active_tab = next((t for t in focused.get("tabs", []) if t.get("active")), None)
-        if not active_tab:
-            return None
-        return {
-            "window_id": focused["id"],
-            "tab_url": active_tab.get("url", ""),
-            "tab_title": active_tab.get("title", ""),
-        }
+        cdp("Target.detachFromTarget", sessionId=sid)
+    except Exception:
+        pass
+
+
+def _page_targets():
+    return [t for t in cdp("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"]
+
+
+def _window_of(tid):
+    try:
+        return cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
     except Exception:
         return None
 
 
-def _smart_focus_main_window(snapshot):
-    """Raise the user's main window to OS foreground WITHOUT changing its
-    active tab. Pair with _capture_user_main_window() called pre-spawn.
-
-    Primary path (extension): chrome.windows.update({focused:true}) on the
-    pre-captured window_id. This is the cleanest API — it raises the window
-    and CANNOT change which tab is active. No URL/title disambiguation, no
-    Target.activateTarget side-effects.
-
-    Fallback (extension offline): Target.activateTarget on whatever tab is
-    CURRENTLY active in the main window. activateTarget on the already-active
-    tab is a no-op for tab selection but still raises the window. We must
-    re-query "what is currently active" — using the pre-spawn snapshot's
-    tab identity would be a bug if the user changed tabs during the spawn.
-
-    Silently noops if everything fails — the cost is just "user has to
-    alt-tab back", which is drastically better than activating the wrong
-    tab and yanking them off a B站 video.
-    """
-    if not snapshot:
-        return
-    # Primary: extension focus_window — pure window-raise, zero tab side-effect
+def _extension(wait=5.0):
+    """The extension client when the companion extension is connected, else None."""
     try:
         from . import bh_extension_client as ext
-        if ext.is_available():
-            ext.send_command("focus_window", windowId=snapshot["window_id"], timeout=2)
-            return
+        if not ext.start_server_if_needed():
+            return None
+        deadline = time.time() + wait
+        while not ext.is_available():
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.25)
+        return ext
     except Exception:
-        pass
-    # Fallback: CDP Target.activateTarget on currently-active tab in main window
+        return None
+
+
+def _new_nonce():
+    return f"{_get_owner_id().replace(':', '-')}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+
+def _nonce_age(url):
+    """Seconds since the nonce in this URL was made. Unknown format = new."""
     try:
-        targets = cdp("Target.getTargets").get("targetInfos", [])
-        # Find a target that is in the main window and is the active one.
-        # Without extension we can't ask "which tab is active" cleanly, so
-        # we use the snapshot's url/title as a hint — but only require it
-        # match if multiple page targets share window_id.
-        # First find page targets and group by Browser.getWindowForTarget.
-        in_main = []
-        for t in targets:
-            if t.get("type") != "page":
-                continue
-            try:
-                wid = cdp("Browser.getWindowForTarget", targetId=t["targetId"]).get("windowId")
-            except Exception:
-                continue
-            if wid == snapshot["window_id"]:
-                in_main.append(t)
-        if not in_main:
-            return
-        url = snapshot.get("tab_url", "") or ""
-        title = snapshot.get("tab_title", "") or ""
-        match = [t for t in in_main if (t.get("url") or "") == url]
-        if len(match) > 1 and title:
-            match = [t for t in match if (t.get("title") or "") == title]
-        if len(match) == 1:
-            tid = match[0]["targetId"]
-        elif len(in_main) == 1:
-            tid = in_main[0]["targetId"]
-        else:
-            return  # ambiguous — refuse rather than yank wrong tab
-        cdp("Target.activateTarget", targetId=tid)
+        nonce = url.split("bh-nonce=", 1)[1].split("&", 1)[0]
+        return time.time() - int(nonce.rsplit("-", 2)[1]) / 1000.0
     except Exception:
-        pass
+        return 0.0
 
 
-# ---------- window/tab discovery ----------
-
-# Tabs the last _list_windows() call could not assign to a window. Non-zero means
-# that snapshot was incomplete and must not be used for content scoring. Module
-# level rather than an attribute on the function so that patching or wrapping
-# _list_windows cannot silently drop the signal.
-_LAST_LIST_DROPPED = 0
-
-
-def _list_windows():
-    """{windowId: [(tid, url, title), ...]} for all real page tabs.
-
-    Also updates the module-level `_LAST_LIST_DROPPED` counter; see above.
-    """
-    targets = cdp("Target.getTargets").get("targetInfos", [])
-    by_window = defaultdict(list)
-    dropped = 0
-    for t in targets:
-        if t.get("type") != "page": continue
-        url = t.get("url", "")
-        if url.startswith(("chrome://", "chrome-extension://", "devtools://")):
-            continue
-        tid = t.get("targetId")
-        try:
-            wid = cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
-            by_window[wid].append((tid, url, t.get("title", "")))
-        except Exception:
-            # A tab we cannot place is a tab missing from every window's list.
-            # That matters because detect_second_window scores windows by their
-            # contents: if the dropped tab was the bilibili one, the user's main
-            # window suddenly looks user-content-free and becomes an eligible
-            # candidate — one CDP hiccup walking straight past the blocklist.
-            #
-            # We cannot know which window it belonged to (that lookup is exactly
-            # what failed), so the only sound response is to flag the snapshot as
-            # incomplete and let content-scoring callers refuse to act on it.
-            dropped += 1
-    global _LAST_LIST_DROPPED
-    _LAST_LIST_DROPPED = dropped
-    return dict(by_window)
-
-
-def _count_user_hits(urls):
-    """How many tabs in this window match a user-domain fingerprint."""
-    n = 0
-    for u in urls:
-        u = (u or "").lower()
-        for d in USER_DOMAINS:
-            if d in u:
-                n += 1
-                break
-    return n
-
-
-def _count_work_hits(urls):
-    n = 0
-    for u in urls:
-        u = (u or "").lower()
-        for d in WORK_DOMAINS:
-            if d in u:
-                n += 1
-                break
-    return n
-
-
-def pin_second_window(wid):
-    """Pin a windowId as the secondary work window. Highest-priority signal —
-    `detect_second_window` will return this wid as long as the window stays
-    alive in CDP. Use when the heuristic picks wrong."""
-    with _state_mutex():
-        state = _load_state()
-        state["pinned_second_window_id"] = wid
-        _save_state(state)
-    return wid
-
-
-def unpin_second_window():
-    """Remove the pin so detect_second_window falls back to heuristics."""
-    with _state_mutex():
-        state = _load_state()
-        state.pop("pinned_second_window_id", None)
-        _save_state(state)
-
-
-def detect_second_window():
-    """
-    Returns (windowId, [(tid,url,title),...]) for user's secondary window,
-    or (None, None) if only 1 window with real tabs exists.
-
-    Decision order (HARD RULE: never spawn into user's main window):
-      1. If `state.pinned_second_window_id` is set and that window is alive,
-         return it. Pin > everything.
-      2. Extension reports `focused=True` for exactly one window → that one
-         is the user's main; eliminate it from candidates.
-      3. Among candidates, score by domain content: WORK_DOMAINS hits boost,
-         USER_DOMAINS hits exclude. Any window containing user-domain URLs
-         is REFUSED as a candidate (huya/bilibili/etc. = user is watching).
-      4. If all candidates contain user-domain URLs → raise RuntimeError
-         (refuse to guess; user must `pin_second_window(wid)`).
-
-    Tab-count fallback is dead — the 2026-05-20 incident proved it inverts
-    when the work window outgrows the main window.
-    """
-    state = _load_state()
-    cdp_windows = _list_windows()
-
-    # 1. Pin path — wins over all signals
-    pinned = state.get("pinned_second_window_id")
-    if pinned and pinned in cdp_windows:
-        return pinned, cdp_windows[pinned]
-    if pinned and pinned not in cdp_windows:
-        # Pinned window died — drop the pin and continue to heuristics
-        state.pop("pinned_second_window_id", None)
-        _save_state(state)
-
-    if len(cdp_windows) < 2:
-        return None, None
-
-    # 2. Build candidate set using extension `focused` if available
-    main_wid_from_ext = None
-    try:
-        from . import bh_extension_client as ext
-        ext.start_server_if_needed()
-        if ext.is_available():
-            wins = ext.send_command("list_windows", timeout=3)
-            if wins:
-                focused = [w for w in wins if w.get("focused")]
-                if len(focused) == 1:
-                    main_wid_from_ext = focused[0]["id"]
-    except Exception:
-        pass
-
-    candidates = [(wid, tabs) for wid, tabs in cdp_windows.items()
-                  if wid != main_wid_from_ext]
-    if not candidates:
-        # Defensive only — unreachable today: the `len(cdp_windows) < 2` early
-        # return above guarantees >=2 windows, and we exclude at most one, so
-        # something always survives. Kept because the old body here was
-        # `candidates = list(cdp_windows.items())`, which would have put the
-        # extension-identified main window back into contention; if the early
-        # return above is ever relaxed, that must not silently come back.
-        # Declining is correct: the caller spawns a fresh window.
-        return None, None
-
-    # 3. Domain-content scoring + user-domain exclusion (HARD GUARD).
-    # Tie-breaker: smaller windowId = older window = more likely user's main
-    # (chrome assigns windowIds in creation order; user told 2026-05-21
-    # "main browser is on the left of taskbar" — task-order proxy = wid order).
-    # So: when work_hits is equal, prefer the LARGER wid (newer = more likely
-    # the secondary user opened later for work).
-    def score(wid_tabs):
-        wid, tabs = wid_tabs
-        urls = [t[1] for t in tabs]
-        if _count_user_hits(urls) > 0:
-            return (-10**6, _count_work_hits(urls), wid)
-        return (0, _count_work_hits(urls), wid)
-
-    # Content scoring is only as good as the snapshot. If _list_windows had to
-    # drop tabs it couldn't place, a user-domain tab may be missing from the very
-    # window we're about to clear — refuse rather than score on partial data.
-    # The caller spawns a clean window, which is always safe.
-    if _LAST_LIST_DROPPED:
-        return None, None
-
-    ranked = sorted(candidates, key=score, reverse=True)
-    chosen_wid, chosen_tabs = ranked[0]
-    chosen_urls = [t[1] for t in chosen_tabs]
-
-    if _count_user_hits(chosen_urls) > 0:
-        # Best candidate still has user content — refuse rather than pollute
-        listing = "\n".join(
-            f"  win={w}  user_hits={_count_user_hits([t[1] for t in ts])}  "
-            f"work_hits={_count_work_hits([t[1] for t in ts])}  tabs={len(ts)}"
-            for w, ts in cdp_windows.items()
-        )
-        raise RuntimeError(
-            "second_window: every chrome window contains user-domain tabs "
-            "(huya/bilibili/youtube/etc.). Refusing to spawn agent tab — "
-            "would pollute user's main window.\n"
-            f"Windows seen:\n{listing}\n"
-            "Fix: open a clean Chrome window for agent work, then call "
-            "browser_harness.second_window.pin_second_window(<wid>)."
-        )
-
-    return chosen_wid, chosen_tabs
-
-
-def spawn_second_window(timeout=10):
-    """Launch new chrome window, immediately minimize to taskbar.
-
-    Behavior contract (user 2026-05-20):
-      - No screen flash (window doesn't bloom in the middle of the monitor)
-      - No focus steal (user's foreground app stays foreground)
-      - But: window must remain inspectable — user clicks the taskbar icon
-        to peek at automation progress. So we do NOT push it offscreen.
-
-    Strategy: prefer the BH companion extension if reachable
-    (chrome.windows.create with focused:false + state:'minimized' = truly
-    silent birth). Subprocess path is fallback — it briefly shows a small
-    window at a screen corner, then CDP minimize sends it to the taskbar
-    within ~150ms. Focus is restored either way.
-    """
-    if not CHROME_EXE:
-        raise RuntimeError("chrome.exe not found — set BH_CHROME_EXE env var")
-
-    # Capture user's main-window focus state BEFORE we touch Chrome. The
-    # subprocess path raises the new window briefly even after we minimize
-    # it (~150ms flash), and during that flash Chrome's "focused" record
-    # points at the new (second) window. We use this snapshot post-spawn
-    # to restore the user's main window via _smart_focus_main_window —
-    # which activates the ALREADY-active tab in main window (no-op for tab
-    # state, raises the window). 2026-05-24 user complaint: "你还是给我
-    # 切到第二窗口" — focus stayed on second window after spawn, no auto-
-    # restore. The previous _restore_main_focus(main_first_tab) approach
-    # was destructive (changed user's active tab); smart-focus is safe.
-    main_snapshot = _capture_user_main_window()
-
-    # Prefer extension path: zero screen flash, zero focus steal
-    try:
-        from . import bh_extension_client as ext
-        ext.start_server_if_needed()
-        if ext.is_available():
-            res = ext.send_command(
-                "create_window",
-                url="about:blank",
-                state="minimized",
-                focused=False,
-                timeout=8,
-            )
-            if res and res.get("ok"):
-                # Use the windowId the extension just handed us (background.js
-                # returns it from chrome.windows.create).
-                #
-                # The old comment here claimed "extension's chrome window id !=
-                # CDP windowId" and threw the value away in favour of
-                # _detect_minimized_blank_window(), which scans for "the one
-                # minimized about:blank window". That guess picks the WRONG
-                # window whenever the user happens to have a blank window open,
-                # and the window we really created then leaks — never used,
-                # never closed.
-                #
-                # Measured 2026-07-30: the two id spaces are identical. Extension
-                # reported [1976814855, 1976815412]; CDP reported the same pair,
-                # and cross-checking a tab from each window through
-                # Browser.getWindowForTarget returned the matching id. (Consistent
-                # with the rest of this file, which already compares extension
-                # ids against CDP window ids on the safety-critical path in
-                # detect_second_window.)
-                ext_wid = res.get("windowId")
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    live = _list_windows()
-                    # Trust the reported id once CDP can see that window too.
-                    wid = ext_wid if ext_wid in live else _detect_minimized_blank_window()
-                    if wid is not None:
-                        # Extension path is silent but call smart-focus anyway —
-                        # it's a cheap activateTarget on an already-active tab,
-                        # serves as belt-and-suspenders if Chrome ever changes
-                        # behavior of chrome.windows.create.
-                        _smart_focus_main_window(main_snapshot)
-                        return wid
-                    time.sleep(0.15)
-    except Exception:
-        pass
-
-    # Fallback: subprocess path. Spawn at corner with modest size so the brief
-    # pre-minimize frame is unobtrusive, then immediately CDP-minimize.
-    initial = set(_list_windows().keys())
-    subprocess.Popen(
-        [
-            CHROME_EXE,
-            "--new-window",
-            "--window-position=20,20",
-            "--window-size=400,300",
-            "about:blank",
-        ],
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
-    )
+def _resolve_nonce(nonce, timeout):
     deadline = time.time() + timeout
-    new_wid = None
-    while time.time() < deadline:
-        time.sleep(0.15)
-        new_wids = set(_list_windows().keys()) - initial
-        if new_wids:
-            new_wid = new_wids.pop()
-            break
-    if new_wid is not None:
-        try:
-            cdp("Browser.setWindowBounds",
-                windowId=new_wid,
-                bounds={"windowState": "minimized"})
-        except Exception:
-            pass
-    # Smart-focus: subprocess path raised new window; pull main back to
-    # foreground without touching its active tab.
-    _smart_focus_main_window(main_snapshot)
-    # Extension-independent backstop. Runs after the CDP minimize above so it
-    # reclaims the foreground the new window took. No-ops when smart-focus
-    # already succeeded (we skip if the HWND is foreground again).
-    if new_wid is None:
-        raise RuntimeError("spawn_second_window: timeout")
-    return new_wid
+    while True:
+        for t in _page_targets():
+            if nonce in (t.get("url") or ""):
+                return t["targetId"]
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
 
 
-def _detect_minimized_blank_window():
-    """Find a CDP windowId whose only tab is about:blank (just-spawned second window)."""
-    targets = cdp("Target.getTargets").get("targetInfos", [])
-    by_window = defaultdict(list)
-    for t in targets:
-        if t.get("type") != "page":
-            continue
-        try:
-            wid = cdp("Browser.getWindowForTarget", targetId=t["targetId"]).get("windowId")
-        except Exception:
-            continue
-        by_window[wid].append(t)
-    for wid, ts in by_window.items():
-        if len(ts) == 1 and (ts[0].get("url") or "").startswith("about:blank"):
+# ---------- the agent window ----------
+
+def find_agent_window(pages=None, state=None):
+    """(window id, anchor tid) of the agent window, or (None, None)."""
+    state = state if state is not None else _load_state()
+    nonce = (state.get("agent_window") or {}).get("nonce")
+    if not nonce:
+        return None, None
+    needle = f"{AGENT_WINDOW_KEY}={nonce}"
+    for t in (pages if pages is not None else _page_targets()):
+        if needle in (t.get("url") or ""):
+            wid = _window_of(t["targetId"])
+            if wid is not None:
+                return wid, t["targetId"]
+    return None, None
+
+
+def ensure_agent_window():
+    wid, _ = find_agent_window()
+    if wid is not None:
+        return wid
+    with _file_lock(_SPAWN_LOCK_PATH, timeout=45.0, stale_after=60.0):
+        wid, _ = find_agent_window()
+        if wid is not None:
             return wid
-    return None
+        return _spawn_agent_window()
 
 
-# ---------- LRU pruning ----------
-
-def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
-    """Close oldest agent tabs over max_n. Only prunes tabs claimed by THIS process
-    (or unclaimed orphans whose owner died). Never poaches another live session's tabs.
-
-    Also reaps CDP-only orphans: tabs that exist in the pinned second window but
-    have no STATE record (typically from prior lost-update races before the
-    state mutex was added). Without this, the cap silently leaked under
-    concurrent fresh-mode load.
-    """
-    my_owner = _get_owner_id()
-    targets = cdp("Target.getTargets").get("targetInfos", [])
-    live_tids = {t.get("targetId") for t in targets if t.get("type") == "page"}
-
+def _spawn_agent_window():
+    nonce = _new_nonce()
+    url = f"https://example.com/?{AGENT_WINDOW_KEY}={nonce}"
     with _state_mutex():
         state = _load_state()
-        _gc_orphan_claims(state)
-        records = state.get("agent_tabs", [])
-        live_records = [r for r in records if r["tid"] in live_tids]
-        not_mine = [r for r in live_records if _read_claim(r) not in (my_owner, None)]
-        mine_or_orphan = [r for r in live_records if _read_claim(r) in (my_owner, None)]
-        victims = []
-        while len(mine_or_orphan) > max_n:
-            mine_or_orphan.sort(key=lambda r: r["last_access"])
-            victims.append(mine_or_orphan.pop(0))
-        state["agent_tabs"] = not_mine + mine_or_orphan
+        state["agent_window"] = {"nonce": nonce, "created_at": time.time()}
+        state.pop("pinned_second_window_id", None)
         _save_state(state)
-
-    # Close outside lock — closeTarget is slow (CDP RTT) and we don't want
-    # other processes blocked on STATE while we wait on the network.
-    closed = 0
-    for v in victims:
+    ext = _extension()
+    if ext is not None:
         try:
-            cdp("Target.closeTarget", targetId=v["tid"])
-            closed += 1
+            ext.send_command("create_window", url=url, state="minimized", focused=False, timeout=8)
         except Exception:
-            pass
+            ext = None
+    if ext is None:
+        print(SPAWN_FOCUS_WARNING, file=sys.stderr)
+        cdp("Target.createTarget", url=url, newWindow=True, background=True, windowState="minimized")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        wid, _ = find_agent_window()
+        if wid is not None:
+            if ext is None:
+                try:
+                    cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "minimized"})
+                except Exception:
+                    pass
+            return wid
+        time.sleep(0.2)
+    raise RuntimeError("the agent window did not appear after spawn")
 
-    # CDP-orphan reap: tabs in second window that no STATE record claims.
-    # Only run when we know the second window — otherwise we'd be guessing.
-    pinned = state.get("pinned_second_window_id")
-    if pinned:
-        try:
-            windows = _list_windows()
-            if pinned in windows:
-                known_tids = {r["tid"] for r in state.get("agent_tabs", []) if r.get("tid")}
-                # Only ever reap tabs that carry OUR spawn marker.
-                #
-                # 2026-07-30: this used to reap any tab in the pinned window that
-                # wasn't in state and wasn't about:blank — which is the definition
-                # of "a tab the user opened themselves". The second window is
-                # explicitly allowed to be a window the user also works in, so
-                # with >max_n of their own tabs open, a prune pass would silently
-                # close (count - max_n) of them, `except Exception: pass` and all.
-                # Upstream 2e89e13 calls this out as "don't touch tabs we didn't
-                # open"; requiring AGENT_TAB_MARKER makes that structural rather
-                # than a guess. Tabs we spawned and then navigated to a real URL
-                # lose the marker, but those are in `state` and get GC'd through
-                # the claim path instead.
-                cdp_orphans = [
-                    (tid, url) for (tid, url, _title) in windows[pinned]
-                    if tid not in known_tids and AGENT_TAB_MARKER in (url or "")
-                ]
-                # Be conservative: only close if window is over the cap. Below cap, leave them.
-                excess = len(windows[pinned]) - max_n
-                if excess > 0:
-                    for tid, _url in cdp_orphans[:excess]:
-                        try:
-                            cdp("Target.closeTarget", targetId=tid)
-                            closed += 1
-                        except Exception:
-                            pass
-        except Exception:
-            pass  # best-effort
-
-    return closed
-
-
-# ---------- core: ensure agent tab ----------
 
 def _assert_landed_in(tid, expected_wid):
-    """Fail loudly if a freshly spawned tab did NOT land in the second window.
+    """Close the new tab and raise when it is not in the agent window.
 
-    This is the last line of defence for the whole fork, and the only one that
-    does not depend on guessing. Everything upstream of it is inference:
-    detect_second_window() reads a heuristic, USER_DOMAINS is a blocklist that is
-    never complete, the extension can be asleep, and a persisted pin can outlive
-    the window it named. Any of those being wrong used to mean a tab silently
-    appeared in the window the user is looking at (2026-05-20 and 2026-07-30 both
-    happened that way). Asking Chrome where the tab actually is turns every one of
-    those misjudgements into an exception instead.
-
-    Copied from image_gen/copilot.py, which had this check while the main entry
-    point did not.
-
-    On mismatch the stray tab is closed before raising — leaving it behind would
-    be exactly the pollution we are trying to prevent.
+    Asks Chrome where the tab is. An unverifiable answer counts as wrong.
     """
     try:
         actual = cdp("Browser.getWindowForTarget", targetId=tid).get("windowId")
     except Exception as e:
-        # Cannot verify. Treat as failure rather than assuming success: an
-        # unverifiable spawn is how tabs end up in the user's window.
         try:
             cdp("Target.closeTarget", targetId=tid)
         except Exception:
             pass
         raise RuntimeError(
-            f"agent tab {tid}: cannot confirm which window it landed in ({e}); "
-            "closed it rather than risk operating on the user's window"
+            f"agent tab {tid}: cannot confirm which window it is in ({e}); closed it"
         )
     if actual != expected_wid:
         try:
@@ -969,321 +449,553 @@ def _assert_landed_in(tid, expected_wid):
         except Exception:
             pass
         raise RuntimeError(
-            f"agent tab landed in window {actual}, expected second window "
-            f"{expected_wid} — closed it. The second-window detection was wrong; "
-            "pin the correct window with second_window.pin_second_window(wid)."
+            f"agent tab opened in window {actual}, not in the agent window {expected_wid}; closed it"
         )
 
 
-def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True):
+def _spawn_agent_tab(wid, use_extension=True):
+    nonce = _new_nonce()
+    url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
+    ext = _extension() if use_extension else None
+    tid = None
+    if ext is not None:
+        r = ext.send_command("create_tab", windowId=wid, url=url, active=False, timeout=10)
+        if not r or "tabId" not in r:
+            raise RuntimeError(f"extension could not create the agent tab: {r}")
+        tid = _resolve_nonce(nonce, 8.0)
+    else:
+        print(SPAWN_FOCUS_WARNING, file=sys.stderr)
+        _, anchor = find_agent_window()
+        if anchor is None:
+            raise RuntimeError("the agent window has no anchor tab to open a tab from")
+        sid = _attach(anchor)
+        try:
+            cdp("Runtime.evaluate", session_id=sid, userGesture=True,
+                expression=f"window.open({json.dumps(url)}, '_blank', 'noopener')")
+        finally:
+            _detach(sid)
+        tid = _resolve_nonce(nonce, 8.0)
+    if tid is None:
+        raise RuntimeError("agent tab spawn failed: the new tab did not show up in CDP")
+    _assert_landed_in(tid, wid)
+    _SPAWNED.add(tid)
+    return tid, nonce
+
+
+# ---------- agent tabs ----------
+
+_SPAWNED = set()      # tabs this process created
+_NAVIGATED = set()    # tabs this process navigated
+
+
+def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True, prefer_url=None):
+    """Lease an agent tab for this process and return its target id.
+
+    Order: a tab this process already holds, then a free tab of this session,
+    then a free tab nobody claims, then a new tab. prefer_url moves tabs whose
+    URL contains it to the front.
     """
-    Ensure an agent tab exists in the user's second Chrome window.
-    Order of operations (HARD RULE: check before create):
-      1. Detect second window. If exists, USE IT.
-      2. If a previously-spawned agent tab in that second window is still
-         alive (per state file), REUSE it. Don't create a new tab.
-      3. Only if no existing agent tab: spawn a new one in the existing
-         second window. Prefer extension path (silent), fallback to CDP
-         window.open with focus restore.
-      4. Only if no second window AT ALL: spawn a new chrome window via
-         chrome.exe --new-window. This is the only path that may steal focus
-         (Windows OS limitation).
+    wid = ensure_agent_window()
+    owner = _get_owner_id()
+    chosen = None
+    with _state_mutex():
+        state = _load_state()
+        pages = {t["targetId"]: t for t in _page_targets()}
+        records = [r for r in state.get("agent_tabs", [])
+                   if r.get("tid") in pages and _window_of(r["tid"]) == wid]
+        state["agent_tabs"] = records
+        _gc_orphan_claims(state)
+        tiers = [
+            [r for r in records if r.get("lease_pid") == os.getpid()],
+            [r for r in records if _read_claim(r) == owner and not _lease_busy(r)],
+            [r for r in records if _read_claim(r) is None and not _lease_busy(r)],
+        ]
+        for tier in tiers:
+            tier.sort(key=lambda r: r.get("last_access", 0), reverse=True)
+        if prefer_url:
+            for tier in tiers:
+                hit = [r for r in tier if prefer_url in (pages[r["tid"]].get("url") or "")]
+                if hit:
+                    chosen = hit[0]
+                    break
+        if chosen is None:
+            chosen = next((tier[0] for tier in tiers if tier), None)
+        if chosen is not None:
+            _take(chosen, owner)
+        _save_state(state)
+    if chosen is None:
+        tid, nonce = _spawn_agent_tab(wid, use_extension=prefer_extension)
+        with _state_mutex():
+            state = _load_state()
+            chosen = {"tid": tid, "nonce": nonce, "created_at": time.time()}
+            _take(chosen, owner)
+            state.setdefault("agent_tabs", []).append(chosen)
+            _save_state(state)
+    _register_exit()
+    prune_agent_tabs(max_n=max_tabs)
+    return chosen["tid"]
 
-    Returns the agent tab targetId.
-    """
-    # 1. Detect — DO NOT create yet
-    second_wid, tabs = detect_second_window()
-    if not second_wid:
-        # No second window exists — must spawn one. Steals focus once.
-        second_wid = spawn_second_window()
-        tabs = _list_windows().get(second_wid, [])
-    if not tabs:
-        raise RuntimeError(f"second window {second_wid} has no usable tabs")
 
-    # 2. Try to reuse a tab CLAIMED BY THIS PROCESS only — never poach another
-    # session's tab (would cause concurrent sessions to fight over one tab,
-    # leading to navigation hijacking. See 2026-05-20 doubao-vs-Nexus incident.)
-    # Use browser-wide live tids (not just second_wid's tabs): detect_second_window
-    # is a flaky heuristic that flips when tab counts shift, so a tab spawned in
-    # round 1 may not appear "in second window" in round 2 even though it's still
-    # live and usable. Filtering by browser-wide live keeps reuse stable.
-    all_targets = cdp("Target.getTargets").get("targetInfos", [])
-    browser_live_tids = {t.get("targetId") for t in all_targets if t.get("type") == "page"}
-    my_owner = _get_owner_id()
+def new_agent_tab(url=None):
+    """Open one more agent tab leased to this process. Does not bind it."""
+    wid = ensure_agent_window()
+    tid, nonce = _spawn_agent_tab(wid)
+    with _state_mutex():
+        state = _load_state()
+        rec = {"tid": tid, "nonce": nonce, "created_at": time.time()}
+        _take(rec, _get_owner_id())
+        state.setdefault("agent_tabs", []).append(rec)
+        _save_state(state)
+    _register_exit()
+    prune_agent_tabs()
+    if url and url != "about:blank":
+        navigate_agent(tid, url)
+    return tid
 
-    # Collect second_wid's tids for orphan adoption below. _list_windows() is
-    # canonical for "what tabs are physically in second window".
-    #
-    # None means "we could not determine this", which is NOT the same as "the
-    # second window has no tabs". The adoption guard below distinguishes them:
-    # an empty set legitimately blocks all adoption, whereas None used to make
-    # the guard vanish entirely (`not second_window_tids or ...`), degrading it
-    # into "adopt an orphan from any window at all" — including the user's.
-    second_window_tids = None
+
+def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
+    """Close the least recently used free agent tabs above max_n, and placeholder
+    tabs in the agent window that lost their record. Returns how many closed."""
+    victims = []
+    with _state_mutex():
+        state = _load_state()
+        pages = {t["targetId"]: t for t in _page_targets()}
+        wid, anchor = find_agent_window(pages=list(pages.values()), state=state)
+        if wid is None:
+            return 0
+        records = [r for r in state.get("agent_tabs", []) if r.get("tid") in pages]
+        excess = len(records) - max_n
+        if excess > 0:
+            free = sorted((r for r in records
+                           if r.get("lease_pid") != os.getpid() and not _lease_busy(r)),
+                          key=lambda r: r.get("last_access", 0))
+            victims = [r["tid"] for r in free[:excess]]
+            records = [r for r in records if r["tid"] not in victims]
+        state["agent_tabs"] = records
+        _save_state(state)
+        known = {r["tid"] for r in records} | set(victims) | {anchor}
+    for tid, t in pages.items():
+        url = t.get("url") or ""
+        if tid in known or "bh-nonce=" not in url:
+            continue
+        if _nonce_age(url) > PLACEHOLDER_REAP_AGE_SECONDS and _window_of(tid) == wid:
+            victims.append(tid)
+    for tid in victims:
+        try:
+            cdp("Target.closeTarget", targetId=tid)
+        except Exception:
+            pass
+        _forget_tab(tid)
+    return len(victims)
+
+
+def is_agent_tab(tid):
+    """Is tid a tab in the agent window, other than the anchor?"""
+    if not tid:
+        return False
+    wid, anchor = find_agent_window()
+    return wid is not None and tid != anchor and _window_of(tid) == wid
+
+
+def is_placeholder(tid):
+    """Does tid still show the placeholder page it was opened with?"""
     try:
-        cdp_windows = _list_windows()
-        if second_wid in cdp_windows:
-            second_window_tids = {t[0] for t in cdp_windows[second_wid]}
+        url = cdp("Target.getTargetInfo", targetId=tid).get("targetInfo", {}).get("url") or ""
+    except Exception:
+        return False
+    return "bh-nonce=" in url
+
+
+# ---------- sessions and the bound tab ----------
+
+_SESSIONS = {}           # tid -> the session this process keeps on it
+_EXTRA_SESSIONS = set()  # sessions that callers attached themselves
+_BOUND = {"tid": None}   # the tab that session-less calls use
+_DAEMON_REPOINTED = [False]
+_EXIT_REGISTERED = [False]
+
+_SESSION_GONE = ("Session with given id not found", "No session with given id")
+_TARGET_GONE = ("No target with given id", "Target closed", "Inspected target navigated or closed")
+# Errors that relay a page's own JS error contain this text. The page controls
+# what follows it, so never scan that part for the markers above.
+_PAGE_ERROR_MARKER = "JavaScript evaluation failed"
+
+
+def _own_text(exc):
+    msg = str(exc)
+    idx = msg.find(_PAGE_ERROR_MARKER)
+    return msg if idx == -1 else msg[:idx]
+
+
+def is_session_gone(exc):
+    return any(n in _own_text(exc) for n in _SESSION_GONE)
+
+
+def is_target_gone(exc):
+    return any(n in _own_text(exc) for n in _TARGET_GONE)
+
+
+def _session_for(tid):
+    sid = _SESSIONS.get(tid)
+    if sid:
+        return sid
+    sid = _attach(tid)
+    for domain in ("Page", "DOM", "Network"):
+        try:
+            cdp(f"{domain}.enable", session_id=sid)
+        except Exception:
+            pass
+    try:
+        # Pages in the minimized agent window then behave as if they have focus.
+        cdp("Emulation.setFocusEmulationEnabled", session_id=sid, enabled=True)
+    except Exception:
+        pass
+    _SESSIONS[tid] = sid
+    _register_exit()
+    return sid
+
+
+def _call(tid, method, _response_timeout=None, **params):
+    """CDP call on this process's session for tid. When only the session is
+    gone, attach again and retry once: it is the same tab, so this is safe."""
+    kw = {} if _response_timeout is None else {"_response_timeout": _response_timeout}
+    try:
+        return cdp(method, session_id=_session_for(tid), **kw, **params)
+    except RuntimeError as e:
+        if not is_session_gone(e):
+            raise
+        _SESSIONS.pop(tid, None)
+        return cdp(method, session_id=_session_for(tid), **kw, **params)
+
+
+def _forget_tab(tid, drop_record=True):
+    sid = _SESSIONS.pop(tid, None)
+    if sid:
+        _detach(sid)
+    if _BOUND["tid"] == tid:
+        _BOUND["tid"] = None
+    if not drop_record:
+        return
+    try:
+        with _state_mutex():
+            state = _load_state()
+            state["agent_tabs"] = [r for r in state.get("agent_tabs", []) if r.get("tid") != tid]
+            _save_state(state)
     except Exception:
         pass
 
-    # Mutex around the read+claim so concurrent fresh callers don't both adopt
-    # the same orphan. Without the lock, two callers see the same orphan, both
-    # write claimed_by=themself, last writer wins, the other operates on a tab
-    # that no longer "belongs" to it — fights ensue when both navigate.
-    with _state_mutex():
-        state = _load_state()
-        _gc_orphan_claims(state)  # release tabs whose owner died
-        mine = [r for r in state.get("agent_tabs", [])
-                if r["tid"] in browser_live_tids and _read_claim(r) == my_owner]
-        if mine:
-            mine.sort(key=lambda r: r["last_access"], reverse=True)
-            tid = mine[0]["tid"]
-            for r in state["agent_tabs"]:
-                if r["tid"] == tid:
-                    r["last_access"] = time.time()
-                    break
-            _save_state(state)
-            adopted_tid = None
-        else:
-            # 2b. ADOPT an orphan tab in second window if one exists.
-            # Prevents fresh-mode soaks from spawning N times when 1 spawn + N
-            # adoptions would do. Each spawn may flash the second window
-            # (Chrome's chrome.tabs.create + window.open behavior even with
-            # active:false isn't 100% silent under load, and chrome.exe
-            # --new-window fallback is definitely loud). User reported
-            # 2026-05-24: "屏幕直接跳到第二个窗口...一直在开 example.com" —
-            # consequence of every fresh caller spawning a fresh agent tab.
-            #
-            # Eligibility: orphan = state record with no claim AND tid still
-            # alive in CDP AND tab is physically in second window (not in
-            # some random window — defense against pin drift).
-            orphans = [
-                r for r in state.get("agent_tabs", [])
-                if r["tid"] in browser_live_tids
-                and _read_claim(r) is None
-                # fail-CLOSED: unknown membership (None) blocks adoption. Losing
-                # a reusable tab just costs one spawn; adopting a tab that turned
-                # out to be in the user's window costs their attention.
-                and second_window_tids is not None
-                and r["tid"] in second_window_tids
-            ]
-            if orphans:
-                # Adopt the most-recently-touched orphan: more likely already on
-                # a useful URL (e.g. example.com) so subsequent goto hits cache.
-                orphans.sort(key=lambda r: r["last_access"], reverse=True)
-                adopted_tid = orphans[0]["tid"]
-                for r in state["agent_tabs"]:
-                    if r["tid"] == adopted_tid:
-                        _write_claim(r, my_owner)
-                        r["last_access"] = time.time()
-                        break
-                _save_state(state)
-            else:
-                adopted_tid = None
-        # else: fall through to spawn (mine empty AND no orphans)
 
-    if mine:
-        prune_agent_tabs(max_n=max_tabs)
-        return tid
-    if adopted_tid:
-        prune_agent_tabs(max_n=max_tabs)
-        return adopted_tid
-
-    # 3. No claim and no orphan to adopt — must spawn a new one.
-    # Capture user's main-window focus state PRE-spawn so we can restore
-    # without changing their active tab. window.open() in 3b can raise a
-    # window in some Chrome configs, and chrome.tabs.create in 3a is silent
-    # but cheap to belt-and-suspender restore from.
-    main_snapshot = _capture_user_main_window()
-
-    # 3a. Prefer extension path (silent, zero focus steal). Auto-start the
-    # local daemon if it's not running yet — extension polls it within ~30s.
-    # If extension is installed, this path always wins; the window.open
-    # fallback below should never fire in practice.
-    if prefer_extension:
-        try:
-            from . import bh_extension_client as ext
-            ext.start_server_if_needed()
-            # Brief grace period for extension to poll & connect on cold start
-            for _ in range(20):
-                if ext.is_available():
-                    break
-                time.sleep(0.25)
-            if ext.is_available():
-                tid, nonce = ext.spawn_agent_tab_in_window(second_wid)
-                if tid:
-                    _assert_landed_in(tid, second_wid)
-                    _record_access(tid, claim=True, nonce=nonce)
-                    prune_agent_tabs(max_n=max_tabs)
-                    _smart_focus_main_window(main_snapshot)
-                    return tid
-        except Exception:
-            pass  # fall through
-
-    # 3b. CDP fallback: window.open from seed tab. Smart-focus restore at end.
-    # Tag window.open URL with a per-call nonce so concurrent callers don't both
-    # match the same "first new agent tab" (2026-05-20 test: two threads racing
-    # on the same window.open both returned the same tid).
-    #
-    # 2026-05-24: prior _restore_main_focus(main_first_tab) was destructive
-    # (yanked user's active tab to tab #0). Replaced with smart-focus that
-    # activates the ALREADY-active tab — raises window without changing tab.
-    import uuid as _uuid
-    # Prefix with the owner id (sanitised — it's "session:<uuid>" or "pid:<n>",
-    # and ':' would muddy the substring scan below) so a stray placeholder in
-    # the URL bar can be traced back to which session leaked it. Uniqueness
-    # comes from the uuid4 suffix, not the prefix.
-    # NOTE: was `my_pid` until 2026-07-27 — that name never existed in this
-    # function after c867cf5 renamed it to my_owner, so this line raised
-    # NameError on every CDP-fallback spawn (extension path never hit it).
-    nonce = f"{my_owner.replace(':', '-')}-{int(time.time()*1000)}-{_uuid.uuid4().hex[:8]}"
-    spawn_url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
-    seed_tid = tabs[0][0]
-    # Capture browser-wide tids BEFORE the spawn so we can identify the
-    # newly-created target by set-diff even if its URL hasn't loaded yet.
-    pre_targets = cdp("Target.getTargets").get("targetInfos", [])
-    pre_tids = {t.get("targetId") for t in pre_targets if t.get("type") == "page"}
-    sid = _attach(seed_tid)
-    try:
-        cdp("Runtime.evaluate", session_id=sid,
-            expression=f"window.open({json.dumps(spawn_url)}, '_blank', 'noopener')",
-            userGesture=True)
-    finally:
-        _detach(sid)
-
-    # Two-phase resolve: first match by nonce-in-URL (preferred — survives
-    # weird race where multiple windows happened to spawn). If nonce never
-    # appears (slow DNS, blocked popup), fall back to set-diff: any target
-    # that didn't exist before our window.open and isn't somebody else's
-    # in-flight spawn (no other PID claims it). This was the 60% failure
-    # mode under 4-parallel cold-start: nonce scan timed out at 2.4s before
-    # Chrome finished assigning the URL. (2026-05-24 200-task soak.)
-    tid = None
-    deadline = time.time() + 8.0
-    while time.time() < deadline:
-        all_targets = cdp("Target.getTargets").get("targetInfos", [])
-        # Phase 1: prefer nonce match
-        for t in all_targets:
-            if t.get("type") == "page" and nonce in (t.get("url") or ""):
-                tid = t.get("targetId")
-                break
-        if tid:
-            break
-        time.sleep(0.25)
-
-    if not tid:
-        # Phase 2: set-diff fallback. Take any new target that wasn't there
-        # before; nonce will eventually populate but we don't need to wait.
-        all_targets = cdp("Target.getTargets").get("targetInfos", [])
-        new_tids = [t.get("targetId") for t in all_targets
-                    if t.get("type") == "page" and t.get("targetId") not in pre_tids]
-        # Filter out tabs already claimed by other live owners
-        state_now = _load_state()
-        other_claimed = {r["tid"] for r in state_now.get("agent_tabs", [])
-                         if _read_claim(r) not in (None, my_owner)}
-        new_unclaimed = [t for t in new_tids if t not in other_claimed]
-        if len(new_unclaimed) == 1:
-            tid = new_unclaimed[0]
-    if not tid:
-        raise RuntimeError("Failed to spawn agent tab — neither nonce nor new-target diff resolved (popup blocker?)")
-    # window.open() always opens in the OPENER's window, so if `tabs[0]` above
-    # belonged to the user's main window, this tab is now sitting in front of
-    # them. Verify before claiming it.
-    _assert_landed_in(tid, second_wid)
-    _record_access(tid, claim=True, nonce=nonce)
-    prune_agent_tabs(max_n=max_tabs)
-    _smart_focus_main_window(main_snapshot)
+def bound_tab():
+    """The agent tab of this process. Leases one on first use."""
+    tid = _BOUND["tid"]
+    if tid is None:
+        tid = ensure_agent_tab()
+        _BOUND["tid"] = tid
+        _repoint_daemon_default()
     return tid
+
+
+def bind(tid):
+    """Make tid the tab for session-less calls. tid must be a free agent tab."""
+    if not is_agent_tab(tid):
+        raise RuntimeError(f"{tid} is not a tab in the agent window")
+    rec = next((r for r in _load_state().get("agent_tabs", []) if r.get("tid") == tid), None)
+    if rec is not None and _lease_busy(rec):
+        raise RuntimeError(f"agent tab {tid} is in use by process {rec.get('lease_pid')}")
+    _record_access(tid, claim=True)
+    _BOUND["tid"] = tid
+    _register_exit()
+    return tid
+
+
+def _repoint_daemon_default():
+    """Move the daemon's default session off the user's tab (the daemon attaches
+    to the first real page when it starts) and onto our anchor tab. Once per process."""
+    if _DAEMON_REPOINTED[0]:
+        return
+    _DAEMON_REPOINTED[0] = True
+    try:
+        wid, anchor = find_agent_window()
+        if anchor is None:
+            return
+        cur = _raw_send({"meta": "current_tab"}).get("targetId")
+        if cur == anchor or (cur and _window_of(cur) == wid):
+            return
+        old = _raw_send({"meta": "session"}).get("session_id")
+        sid = _attach(anchor)
+        _raw_send({"meta": "set_session", "session_id": sid, "target_id": anchor})
+        if old:
+            _detach(old)
+    except Exception:
+        pass
+
+
+def _register_exit():
+    if not _EXIT_REGISTERED[0]:
+        _EXIT_REGISTERED[0] = True
+        import atexit
+        atexit.register(_exit_cleanup)
+
+
+def _exit_cleanup():
+    """Release this process's leases, close the placeholder tabs it never used,
+    detach its sessions. BH_KEEP_PLACEHOLDERS=1 keeps the placeholders."""
+    try:
+        keep = os.environ.get("BH_KEEP_PLACEHOLDERS") == "1"
+        pages = {t["targetId"]: t for t in _page_targets()}
+        to_close = []
+        with _state_mutex(timeout=5.0):
+            state = _load_state()
+            kept = []
+            for r in state.get("agent_tabs", []):
+                if r.get("lease_pid") == os.getpid():
+                    r["lease_pid"] = None
+                    url = (pages.get(r["tid"]) or {}).get("url") or ""
+                    placeholder = bool(r.get("nonce")) and r["nonce"] in url
+                    unused = (r["tid"] in _SPAWNED and r["tid"] not in _NAVIGATED
+                              and url in ("", "about:blank"))
+                    if not keep and r["tid"] in pages and (placeholder or unused):
+                        to_close.append(r["tid"])
+                        continue
+                kept.append(r)
+            state["agent_tabs"] = kept
+            _save_state(state)
+        for sid in list(_SESSIONS.values()) + list(_EXTRA_SESSIONS):
+            _detach(sid)
+        _SESSIONS.clear()
+        _EXTRA_SESSIONS.clear()
+        for tid in to_close:
+            try:
+                cdp("Target.closeTarget", targetId=tid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ---------- safe-mode request policy (installed by helpers) ----------
+
+_REFUSED = {
+    "Target.activateTarget": "Focus changes are blocked in safe mode. When the user must see "
+                             "the agent window (to type a password), call show_window().",
+    "Browser.close": "Closing Chrome is blocked: it is the user's daily browser.",
+    "Browser.crash": "Crashing Chrome is blocked: it is the user's daily browser.",
+    "Browser.crashGpuProcess": "Crashing Chrome is blocked: it is the user's daily browser.",
+}
+_IGNORED = {"Page.bringToFront"}
+_WINDOW_CACHE = {}
+
+
+def _window_of_cached(tid, ttl=5.0):
+    hit = _WINDOW_CACHE.get(tid)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    wid = _window_of(tid)
+    _WINDOW_CACHE[tid] = (wid, time.time())
+    return wid
+
+
+def _require_agent_target(tid, action):
+    try:
+        info = cdp("Target.getTargetInfo", targetId=tid).get("targetInfo", {})
+    except Exception:
+        return  # a bad id: let Chrome report it
+    if info.get("type") == "page" and not is_agent_tab(tid):
+        raise RuntimeError(
+            f"{action} refused: {tid} is not a tab in the agent window. BH only drives "
+            "tabs in its own window. To read a page the user has open, open its URL with goto()."
+        )
+
+
+def _filter_targets(response):
+    res = response.get("result") or {}
+    infos = res.get("targetInfos")
+    if not isinstance(infos, list):
+        return response
+    wid, anchor = find_agent_window(pages=[t for t in infos if t.get("type") == "page"])
+    keep = [t for t in infos if t.get("type") != "page"
+            or (wid is not None and t.get("targetId") != anchor
+                and _window_of_cached(t.get("targetId")) == wid)]
+    return {**response, "result": {**res, "targetInfos": keep}}
+
+
+def request_policy(req, forward):
+    """Rewrite or refuse one daemon request. forward(req) sends it unchanged."""
+    meta = req.get("meta")
+    if meta:
+        return _meta_policy(req, forward)
+    method = req.get("method") or ""
+    params = req.get("params") or {}
+    if method in _REFUSED:
+        raise RuntimeError(_REFUSED[method])
+    if method in _IGNORED:
+        return {"result": {}}
+    if method == "Target.createTarget":
+        return {"result": {"targetId": new_agent_tab(params.get("url"))}}
+    if method == "Target.closeTarget":
+        tid = params.get("targetId")
+        if not is_agent_tab(tid):
+            raise RuntimeError(f"Target.closeTarget refused: {tid} is not a tab in the agent window")
+        response = forward(req)
+        _forget_tab(tid)
+        return response
+    if method == "Target.attachToTarget":
+        _require_agent_target(params.get("targetId"), "Target.attachToTarget")
+        response = forward(req)
+        sid = (response.get("result") or {}).get("sessionId")
+        if sid:
+            _EXTRA_SESSIONS.add(sid)
+        return response
+    if method == "Target.getTargets":
+        return _filter_targets(forward(req))
+    if method == "Browser.setWindowBounds":
+        wid, _ = find_agent_window()
+        if wid is None or params.get("windowId") != wid:
+            raise RuntimeError("Browser.setWindowBounds refused: only the agent window can change")
+        return forward(req)
+    if method.startswith("Target.") or req.get("session_id"):
+        return forward(req)
+    return _on_bound_tab(req, method, forward)
+
+
+def _meta_policy(req, forward):
+    meta = req["meta"]
+    if meta == "current_tab":
+        for attempt in (1, 2):
+            tid = bound_tab()
+            try:
+                info = cdp("Target.getTargetInfo", targetId=tid).get("targetInfo", {})
+                return {"targetId": tid, "url": info.get("url", ""), "title": info.get("title", "")}
+            except RuntimeError as e:
+                if attempt == 2 or not is_target_gone(e):
+                    raise
+                _forget_tab(tid)
+    if meta == "session":
+        return {"session_id": _session_for(bound_tab())}
+    if meta == "set_session":
+        bind(req.get("target_id"))
+        return {"session_id": req.get("session_id")}
+    return forward(req)
+
+
+def _forward_on(tid, req, forward):
+    try:
+        return forward({**req, "session_id": _session_for(tid)})
+    except RuntimeError as e:
+        if not is_session_gone(e):
+            raise
+        _SESSIONS.pop(tid, None)
+        # Raises "No target" when the tab itself is gone.
+        return forward({**req, "session_id": _session_for(tid)})
+
+
+def _on_bound_tab(req, method, forward):
+    tid = bound_tab()
+    try:
+        response = _forward_on(tid, req, forward)
+    except RuntimeError as e:
+        if not is_target_gone(e):
+            raise
+        _forget_tab(tid)
+        if method != "Page.navigate":
+            raise RuntimeError(
+                f"the agent tab closed during {method}. The call was not repeated on a "
+                f"new tab, because page state does not carry over. Call goto() again. ({e})"
+            ) from e
+        tid = bound_tab()
+        response = _forward_on(tid, req, forward)
+    if method == "Page.navigate":
+        _NAVIGATED.add(tid)
+    _touch(tid)
+    return response
 
 
 # ---------- agent operations ----------
 
+def _eval_value(agent_tid, expression):
+    r = _call(agent_tid, "Runtime.evaluate", expression=expression, returnByValue=True)
+    return (r.get("result") or {}).get("value")
+
+
 def navigate_agent(agent_tid, url, timeout=15):
-    sid = _attach(agent_tid)
+    """Navigate and wait until the new document is complete.
+    False on timeout or when Chrome reports a load error."""
     try:
-        cdp("Page.enable", session_id=sid)
-        cdp("Page.navigate", session_id=sid, url=url)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            r = cdp("Runtime.evaluate", session_id=sid, expression="document.readyState")
-            if r.get("result", {}).get("value") == "complete":
-                _record_access(agent_tid)
-                return True
-            time.sleep(0.3)
-        _record_access(agent_tid)
+        before = _eval_value(agent_tid, "performance.timeOrigin")
+    except Exception:
+        before = None
+    r = _call(agent_tid, "Page.navigate", url=url)
+    _NAVIGATED.add(agent_tid)
+    _touch(agent_tid)
+    if r.get("errorText"):
         return False
-    finally:
-        _detach(sid)
+    if not r.get("loaderId"):
+        return True  # same-document navigation
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            v = _eval_value(agent_tid, "[performance.timeOrigin, document.readyState]")
+        except RuntimeError as e:
+            if is_target_gone(e):
+                raise
+            v = None  # the old context went away during the navigation
+        if v and v[0] != before and v[1] == "complete":
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def snapshot_agent(agent_tid, max_chars=10000):
-    sid = _attach(agent_tid)
-    try:
-        r = cdp("Runtime.evaluate", session_id=sid, expression="document.body.innerText")
-        _record_access(agent_tid)
-        return (r.get("result", {}).get("value") or "")[:max_chars]
-    finally:
-        _detach(sid)
+    _touch(agent_tid)
+    return (_eval_value(agent_tid, "document.body ? document.body.innerText : ''") or "")[:max_chars]
 
 
-def screenshot_agent(agent_tid, path):
-    sid = _attach(agent_tid)
-    try:
-        r = cdp("Page.captureScreenshot", session_id=sid, format="png")
-        data = base64.b64decode(r.get("data", ""))
-        pathlib.Path(path).write_bytes(data)
-        _record_access(agent_tid)
-        return len(data)
-    finally:
-        _detach(sid)
+def screenshot_agent(agent_tid, path, full=False):
+    r = _call(agent_tid, "Page.captureScreenshot", _response_timeout=60.0,
+              format="png", captureBeyondViewport=full)
+    data = base64.b64decode(r.get("data", ""))
+    pathlib.Path(path).write_bytes(data)
+    _touch(agent_tid)
+    return len(data)
 
 
 def save_as_pdf_agent(agent_tid, path):
-    sid = _attach(agent_tid)
-    try:
-        r = cdp("Page.printToPDF", session_id=sid, printBackground=True, preferCSSPageSize=True)
-        data = base64.b64decode(r.get("data", ""))
-        pathlib.Path(path).write_bytes(data)
-        _record_access(agent_tid)
-        return len(data)
-    finally:
-        _detach(sid)
+    r = _call(agent_tid, "Page.printToPDF", _response_timeout=60.0,
+              printBackground=True, preferCSSPageSize=True)
+    data = base64.b64decode(r.get("data", ""))
+    pathlib.Path(path).write_bytes(data)
+    _touch(agent_tid)
+    return len(data)
 
 
-def evaluate_agent(agent_tid, expression):
-    sid = _attach(agent_tid)
+def evaluate_agent(agent_tid, expression, await_promise=True):
+    """Same semantics as helpers.js(): values come back by value, promises are
+    awaited, a top-level `return` is retried inside a function, JS errors raise."""
+    from .helpers import _is_illegal_return_error, _runtime_value, _wrap_js_function
+
+    def run(expr):
+        r = _call(agent_tid, "Runtime.evaluate", expression=expr,
+                  returnByValue=True, awaitPromise=await_promise)
+        return _runtime_value(r, expr)
+
     try:
-        r = cdp("Runtime.evaluate", session_id=sid, expression=expression)
-        _record_access(agent_tid)
-        # Match helpers.js() behavior: raise on JS exceptions / parse errors
-        # rather than silently returning None. Without this, eval_js("syntax @#")
-        # or eval_js("undefined.x") returned None and masked user-code bugs.
-        details = r.get("exceptionDetails")
-        result = r.get("result", {}) or {}
-        if details or result.get("subtype") == "error":
-            ex = (details or {}).get("exception", {}) or {}
-            desc = ex.get("description") or result.get("description") or (details or {}).get("text") or "JavaScript error"
-            raise RuntimeError(f"JavaScript evaluation failed: {desc}")
-        return result.get("value")
-    finally:
-        _detach(sid)
+        value = run(expression)
+    except RuntimeError as e:
+        if not _is_illegal_return_error(e):
+            raise
+        value = run(_wrap_js_function(expression))
+    _touch(agent_tid)
+    return value
 
 
 def click_at_agent(agent_tid, x, y, button="left"):
-    sid = _attach(agent_tid)
-    try:
-        cdp("Input.dispatchMouseEvent", session_id=sid,
-            type="mousePressed", x=x, y=y, button=button, clickCount=1)
-        cdp("Input.dispatchMouseEvent", session_id=sid,
-            type="mouseReleased", x=x, y=y, button=button, clickCount=1)
-        _record_access(agent_tid)
-        return True
-    finally:
-        _detach(sid)
+    _call(agent_tid, "Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+    _call(agent_tid, "Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=1)
+    _call(agent_tid, "Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=1)
+    _touch(agent_tid)
+    return True
 
 
-# Kimi-compat alias
 mouse_click_agent = click_at_agent
 
 
@@ -1297,35 +1009,29 @@ _VK_MAP = {
 
 
 def key_type_agent(agent_tid, text):
-    sid = _attach(agent_tid)
-    try:
-        for ch in text:
-            cdp("Input.dispatchKeyEvent", session_id=sid, type="keyDown", text=ch)
-            cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp", text=ch)
-        _record_access(agent_tid)
-    finally:
-        _detach(sid)
+    for ch in text:
+        _call(agent_tid, "Input.dispatchKeyEvent", type="keyDown", text=ch)
+        _call(agent_tid, "Input.dispatchKeyEvent", type="keyUp", text=ch)
+    _touch(agent_tid)
 
 
 def send_keys_agent(agent_tid, keys):
-    sid = _attach(agent_tid)
-    try:
-        for k in keys:
-            if len(k) == 1:
-                cdp("Input.dispatchKeyEvent", session_id=sid, type="keyDown", text=k)
-                cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp", text=k)
-            else:
-                vk = _VK_MAP.get(k, 0)
-                cdp("Input.dispatchKeyEvent", session_id=sid, type="rawKeyDown",
-                    code=k, key=k, windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
-                cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
-                    code=k, key=k, windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
-        _record_access(agent_tid)
-    finally:
-        _detach(sid)
+    for k in keys:
+        if len(k) == 1:
+            _call(agent_tid, "Input.dispatchKeyEvent", type="keyDown", text=k)
+            _call(agent_tid, "Input.dispatchKeyEvent", type="keyUp", text=k)
+        else:
+            vk = _VK_MAP.get(k, 0)
+            text = "\r" if k in ("Enter", "Return") else None
+            down = dict(type="rawKeyDown", code=k, key=k, windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
+            _call(agent_tid, "Input.dispatchKeyEvent", **down)
+            if text:
+                _call(agent_tid, "Input.dispatchKeyEvent", type="char", text=text)
+            _call(agent_tid, "Input.dispatchKeyEvent", **{**down, "type": "keyUp"})
+    _touch(agent_tid)
 
 
-# CDP Input.dispatchKeyEvent modifiers bitmask.
+# CDP Input.dispatchKeyEvent modifier bits: (bit, vk, code, key)
 _CHORD_MODS = {
     "alt": (1, 18, "AltLeft", "Alt"),
     "ctrl": (2, 17, "ControlLeft", "Control"),
@@ -1339,31 +1045,24 @@ _CHORD_MODS = {
 
 
 def _resolve_chord_key(tok):
-    """Map a final-key token to (windowsVirtualKeyCode, code, key) for CDP."""
     if len(tok) == 1:
         ch = tok.upper()
         if "A" <= ch <= "Z":
             return ord(ch), "Key" + ch, tok
         if "0" <= ch <= "9":
             return ord(ch), "Digit" + ch, tok
-        return 0, tok, tok  # punctuation: best-effort, let Chrome map by code
-    vk = _VK_MAP.get(tok, 0)
-    return vk, tok, tok
+        return 0, tok, tok
+    return _VK_MAP.get(tok, 0), tok, tok
 
 
 def hotkey_agent(agent_tid, chord):
-    """Press a modifier chord like "Control+End", "Ctrl+A", "Shift+ArrowRight".
-
-    Holds each modifier down (carrying the cumulative CDP modifier bitmask),
-    presses the final key with that bitmask active, then releases everything in
-    reverse. Unlike send_keys_agent (which iterates tokens independently and has
-    no concept of held modifiers), this produces a real shortcut chord.
-    """
+    """Press a chord such as "Control+End" or "Shift+ArrowRight" with the
+    modifiers held down."""
     parts = [p.strip() for p in chord.split("+") if p.strip()]
     if not parts:
         return
     *mod_names, final = parts
-    mods = []  # (bit, vk, code, key)
+    mods = []
     for name in mod_names:
         m = _CHORD_MODS.get(name.lower())
         if m is None:
@@ -1373,111 +1072,290 @@ def hotkey_agent(agent_tid, chord):
     for bit, *_ in mods:
         mask |= bit
     fvk, fcode, fkey = _resolve_chord_key(final)
-
-    sid = _attach(agent_tid)
-    try:
-        held = 0
-        for bit, vk, code, key in mods:
-            held |= bit
-            cdp("Input.dispatchKeyEvent", session_id=sid, type="rawKeyDown",
-                code=code, key=key, windowsVirtualKeyCode=vk,
-                nativeVirtualKeyCode=vk, modifiers=held)
-        # Final key. No `text` is sent: with a non-shift modifier held that would
-        # emit a control char instead of triggering the shortcut.
-        cdp("Input.dispatchKeyEvent", session_id=sid, type="rawKeyDown",
-            code=fcode, key=fkey, windowsVirtualKeyCode=fvk,
-            nativeVirtualKeyCode=fvk, modifiers=mask)
-        cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
-            code=fcode, key=fkey, windowsVirtualKeyCode=fvk,
-            nativeVirtualKeyCode=fvk, modifiers=mask)
-        for bit, vk, code, key in reversed(mods):
-            held &= ~bit
-            cdp("Input.dispatchKeyEvent", session_id=sid, type="keyUp",
-                code=code, key=key, windowsVirtualKeyCode=vk,
-                nativeVirtualKeyCode=vk, modifiers=held)
-        _record_access(agent_tid)
-    finally:
-        _detach(sid)
+    held = 0
+    for bit, vk, code, key in mods:
+        held |= bit
+        _call(agent_tid, "Input.dispatchKeyEvent", type="rawKeyDown", code=code, key=key,
+              windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk, modifiers=held)
+    # No `text` on the final key: with a modifier held it would type a control
+    # character instead of firing the shortcut.
+    for kind in ("rawKeyDown", "keyUp"):
+        _call(agent_tid, "Input.dispatchKeyEvent", type=kind, code=fcode, key=fkey,
+              windowsVirtualKeyCode=fvk, nativeVirtualKeyCode=fvk, modifiers=mask)
+    for bit, vk, code, key in reversed(mods):
+        held &= ~bit
+        _call(agent_tid, "Input.dispatchKeyEvent", type="keyUp", code=code, key=key,
+              windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk, modifiers=held)
+    _touch(agent_tid)
 
 
 def upload_agent(agent_tid, selector, file_paths):
-    sid = _attach(agent_tid)
-    try:
-        doc = cdp("DOM.getDocument", session_id=sid)
-        root_id = doc.get("root", {}).get("nodeId")
-        node = cdp("DOM.querySelector", session_id=sid, nodeId=root_id, selector=selector)
-        node_id = node.get("nodeId")
-        if not node_id:
-            return "no-element"
-        cdp("DOM.setFileInputFiles", session_id=sid, files=list(file_paths), nodeId=node_id)
-        _record_access(agent_tid)
-        return f"uploaded {len(file_paths)} file(s)"
-    finally:
-        _detach(sid)
+    if isinstance(file_paths, (str, os.PathLike)):
+        file_paths = [file_paths]
+    root = _call(agent_tid, "DOM.getDocument").get("root", {}).get("nodeId")
+    node_id = _call(agent_tid, "DOM.querySelector", nodeId=root, selector=selector).get("nodeId")
+    if not node_id:
+        raise RuntimeError(f"upload: no element matched selector {selector!r}")
+    _call(agent_tid, "DOM.setFileInputFiles", files=[str(p) for p in file_paths], nodeId=node_id)
+    _touch(agent_tid)
+    return f"uploaded {len(file_paths)} file(s)"
+
+
+# Sets the value through the prototype setter, so React and Vue see the change.
+_FILL_FN = """function(v) {
+  this.scrollIntoView({block: 'center'});
+  this.focus();
+  if (this.isContentEditable) {
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, v);
+    return 'filled';
+  }
+  if (!('value' in this)) return 'not-fillable';
+  const proto = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+    : this instanceof HTMLSelectElement ? HTMLSelectElement.prototype
+    : HTMLInputElement.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) desc.set.call(this, v); else this.value = v;
+  this.dispatchEvent(new Event('input', {bubbles: true}));
+  this.dispatchEvent(new Event('change', {bubbles: true}));
+  return 'filled';
+}"""
 
 
 def fill_agent(agent_tid, selector, value):
-    sid = _attach(agent_tid)
-    try:
-        expr = f"""(()=>{{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return 'no-element';
-            el.focus();
-            el.value = {json.dumps(value)};
-            el.dispatchEvent(new Event('input', {{bubbles:true}}));
-            el.dispatchEvent(new Event('change', {{bubbles:true}}));
-            return 'filled';
-        }})()"""
-        r = cdp("Runtime.evaluate", session_id=sid, expression=expr)
-        _record_access(agent_tid)
-        # Surface JS errors (invalid selector throws DOMException, etc.) instead
-        # of silently returning None — mirrors evaluate_agent's behavior so
-        # callers can distinguish "no-element" (returned) from "selector
-        # syntactically invalid" (raised).
-        details = r.get("exceptionDetails")
-        result = r.get("result", {}) or {}
-        if details or result.get("subtype") == "error":
-            ex = (details or {}).get("exception", {}) or {}
-            desc = ex.get("description") or result.get("description") or (details or {}).get("text") or "fill failed"
-            raise RuntimeError(f"fill failed: {desc}")
-        v = result.get("value")
-        if v == "no-element":
-            raise RuntimeError(f"fill: no element matched selector {selector!r}")
-        return v
-    finally:
-        _detach(sid)
+    expr = (f"(() => {{ const el = document.querySelector({json.dumps(selector)});"
+            f" if (!el) return 'no-element'; return ({_FILL_FN}).call(el, {json.dumps(value)}); }})()")
+    result = evaluate_agent(agent_tid, expr)
+    if result == "no-element":
+        raise RuntimeError(f"fill: no element matched selector {selector!r}")
+    if result != "filled":
+        raise RuntimeError(f"fill: {selector!r} is {result}")
+    return result
 
+
+# ---------- accessibility snapshot with @e refs ----------
+#
+# snapshot_tree_agent() saves its refs in REF_DIR/<tid>.json, so a later
+# heredoc can still use click_ref("@e3"). A ref is valid while the document
+# that made it is still loaded.
+
+_INTERACTIVE_ROLES = {
+    "button", "link", "checkbox", "radio", "textbox", "searchbox", "combobox",
+    "listbox", "option", "menuitem", "menuitemcheckbox", "menuitemradio", "tab",
+    "switch", "slider", "spinbutton", "treeitem", "heading",
+}
+_VALUE_ROLES = {"textbox", "searchbox", "combobox", "spinbutton", "slider"}
+_STATE_PROPS = ("focused", "checked", "selected", "disabled", "expanded", "required")
+_SKIP_ROLES = {"generic", "none", "InlineTextBox", "LineBreak", "RootWebArea"}
+
+
+def _ax_value(field):
+    return (field or {}).get("value") if isinstance(field, dict) else None
+
+
+def _ref_path(tid):
+    return REF_DIR / f"{tid}.json"
+
+
+def snapshot_tree_agent(agent_tid, interactive_only=True, roles=None, max_chars=12000):
+    """Accessibility tree as text lines like `@e3 button "Sign in"`."""
+    r = _call(agent_tid, "Accessibility.getFullAXTree", _response_timeout=30.0)
+    nodes = r.get("nodes") or []
+    by_id = {n.get("nodeId"): n for n in nodes}
+    roles = set(roles) if roles else None
+    lines, refs = [], {}
+
+    def keep(node, role, name):
+        if roles is not None:
+            return role in roles
+        if role in _INTERACTIVE_ROLES:
+            return bool(name) or role in _VALUE_ROLES
+        return not interactive_only and bool(name) and role not in _SKIP_ROLES
+
+    def walk(node, depth):
+        role = _ax_value(node.get("role")) or ""
+        name = (_ax_value(node.get("name")) or "").strip()
+        shown = not node.get("ignored") and node.get("backendDOMNodeId") and keep(node, role, name)
+        if shown:
+            key = f"e{len(refs) + 1}"
+            refs[key] = {"b": node["backendDOMNodeId"], "role": role, "name": name[:200]}
+            line = f'{"  " * depth}@{key} {role} {json.dumps(name[:80], ensure_ascii=False)}'
+            value = _ax_value(node.get("value"))
+            if role in _VALUE_ROLES and value not in (None, ""):
+                line += f" value={json.dumps(str(value)[:60], ensure_ascii=False)}"
+            for p in node.get("properties") or []:
+                pname, pval = p.get("name"), _ax_value(p.get("value"))
+                if pname in _STATE_PROPS and pval not in (None, False, "false"):
+                    line += f" [{pname}]" if pval is True or pval == "true" else f" [{pname}={pval}]"
+            lines.append(line)
+        for cid in node.get("childIds") or []:
+            child = by_id.get(cid)
+            if child is not None:
+                walk(child, depth + 1 if shown else depth)
+
+    root = next((n for n in nodes if not n.get("parentId")), None)
+    if root is not None:
+        walk(root, 0)
+    REF_DIR.mkdir(parents=True, exist_ok=True)
+    _ref_path(agent_tid).write_text(json.dumps({
+        "document": _eval_value(agent_tid, "performance.timeOrigin"),
+        "refs": refs,
+    }), encoding="utf-8")
+    _touch(agent_tid)
+    text, total = "", 0
+    for i, line in enumerate(lines):
+        if total + len(line) + 1 > max_chars:
+            text += f"... ({len(lines) - i} more lines; pass roles= or max_chars= to see them)\n"
+            break
+        text += line + "\n"
+        total += len(line) + 1
+    return text.rstrip("\n")
+
+
+def _ref_node(agent_tid, ref):
+    key = str(ref).lstrip("@")
+    try:
+        data = json.loads(_ref_path(agent_tid).read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    node = (data.get("refs") or {}).get(key)
+    if node is None:
+        raise RuntimeError(f"unknown ref {ref}: call snapshot() first")
+    if data.get("document") != _eval_value(agent_tid, "performance.timeOrigin"):
+        raise RuntimeError(f"ref {ref} is stale: the page loaded a new document. Call snapshot() again.")
+    return node
+
+
+def _resolve_ref(agent_tid, ref):
+    node = _ref_node(agent_tid, ref)
+    try:
+        obj = _call(agent_tid, "DOM.resolveNode", backendNodeId=node["b"]).get("object", {})
+    except RuntimeError as e:
+        raise RuntimeError(f"ref {ref} is stale: its element is gone ({e}). Call snapshot() again.") from e
+    return node, obj.get("objectId")
+
+
+def ref_for_agent(agent_tid, query, role=None):
+    """First ref whose name matches query (exact match first, then substring).
+    query can also be a function of (role, name)."""
+    try:
+        refs = json.loads(_ref_path(agent_tid).read_text(encoding="utf-8")).get("refs") or {}
+    except Exception:
+        return None
+    items = [(k, n) for k, n in refs.items() if role is None or n.get("role") == role]
+    if callable(query):
+        return next((f"@{k}" for k, n in items if query(n.get("role"), n.get("name") or "")), None)
+    q = str(query).strip().lower()
+    for exact in (True, False):
+        for k, n in items:
+            name = (n.get("name") or "").lower()
+            if (name == q) if exact else (q in name):
+                return f"@{k}"
+    return None
+
+
+def click_ref_agent(agent_tid, ref):
+    node, obj = _resolve_ref(agent_tid, ref)
+    try:
+        _call(agent_tid, "DOM.scrollIntoViewIfNeeded", backendNodeId=node["b"])
+    except RuntimeError:
+        pass
+    try:
+        quads = _call(agent_tid, "DOM.getContentQuads", backendNodeId=node["b"]).get("quads") or []
+    except RuntimeError:
+        quads = []
+    if quads:
+        q = quads[0]
+        x, y = sum(q[0::2]) / 4, sum(q[1::2]) / 4
+        click_at_agent(agent_tid, x, y)
+        return {"clicked": ref, "x": round(x), "y": round(y)}
+    # No box (zero size or hidden): click through the DOM instead.
+    _call(agent_tid, "Runtime.callFunctionOn", objectId=obj, functionDeclaration="function(){this.click()}")
+    _touch(agent_tid)
+    return {"clicked": ref, "via": "dom"}
+
+
+def fill_ref_agent(agent_tid, ref, value, submit=False):
+    _, obj = _resolve_ref(agent_tid, ref)
+    r = _call(agent_tid, "Runtime.callFunctionOn", objectId=obj, functionDeclaration=_FILL_FN,
+              arguments=[{"value": value}], returnByValue=True)
+    result = (r.get("result") or {}).get("value")
+    if result != "filled":
+        raise RuntimeError(f"fill_ref {ref}: element is {result}")
+    if submit:
+        send_keys_agent(agent_tid, ["Enter"])
+    _touch(agent_tid)
+    return result
+
+
+# ---------- tab list ----------
 
 def list_agent_tabs():
     state = _load_state()
-    targets = cdp("Target.getTargets").get("targetInfos", [])
-    live = {t.get("targetId"): t for t in targets if t.get("type") == "page"}
+    pages = {t["targetId"]: t for t in _page_targets()}
     out = []
     for r in state.get("agent_tabs", []):
-        info = live.get(r["tid"])
+        info = pages.get(r.get("tid"))
         if info:
             out.append({
-                "tid": r["tid"],
-                "url": info.get("url", ""),
-                "title": info.get("title", ""),
-                "last_access": r["last_access"],
+                "tid": r["tid"], "url": info.get("url", ""), "title": info.get("title", ""),
+                "last_access": r.get("last_access"),
+                "mine": r.get("lease_pid") == os.getpid(), "busy": _lease_busy(r),
             })
     return out
 
 
 def find_agent_tab(url_substring):
     for t in list_agent_tabs():
-        if url_substring in t["url"]:
+        if url_substring in t["url"] and not t["busy"]:
             return t["tid"]
     return None
 
 
 def close_agent_tab(agent_tid):
+    if not is_agent_tab(agent_tid):
+        return False
     try:
         cdp("Target.closeTarget", targetId=agent_tid)
-        state = _load_state()
-        state["agent_tabs"] = [r for r in state.get("agent_tabs", []) if r["tid"] != agent_tid]
-        _save_state(state)
-        return True
     except Exception:
         return False
+    _forget_tab(agent_tid)
+    return True
+
+
+def close_agent_tabs_matching(url_substring, keep=None):
+    """Close free agent tabs whose URL contains url_substring, except keep."""
+    closed = 0
+    for t in list_agent_tabs():
+        if t["tid"] != keep and not t["busy"] and url_substring in t["url"]:
+            closed += bool(close_agent_tab(t["tid"]))
+    return closed
+
+
+# ---------- showing the window for a login ----------
+
+def show_window(tid=None):
+    """Bring the agent window to the front so the user can type a password.
+    Call hide_window() when the user says they are done."""
+    wid = ensure_agent_window()
+    tid = tid or _BOUND["tid"]
+    ext = _extension(wait=2.0)
+    if ext is not None:
+        ext.send_command("update_window", windowId=wid, state="normal", focused=True, timeout=5)
+    else:
+        cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "normal"})
+    if tid:
+        cdp("Target.activateTarget", targetId=tid)
+    return wid
+
+
+def hide_window():
+    wid, _ = find_agent_window()
+    if wid is None:
+        return None
+    ext = _extension(wait=2.0)
+    if ext is not None:
+        ext.send_command("update_window", windowId=wid, state="minimized", timeout=5)
+    else:
+        cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "minimized"})
+    return wid

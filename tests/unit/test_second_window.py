@@ -1,18 +1,11 @@
-"""detect_second_window() must never hand back the user's main window.
+"""second_window must keep every agent action inside the window that BH created.
 
-This is the load-bearing invariant of the whole second-window fork: every agent
-action is routed at whatever window this function returns, so picking the main
-window means inserting tabs into the window the user is actively looking at.
-
-2026-07-30 regression: `if not candidates: candidates = list(cdp_windows.items())`
-put the extension-identified main window back into contention. It then only had
-to survive the USER_DOMAINS guard — a blocklist that is never complete — and a
-tab landed in the user's main window (tabs were m365 + a Tailscale-addressed
-sub2api panel, neither of which was listed at the time).
+The fake browser below stands in for Chrome behind the daemon. USER_WID is the
+user's own window; nothing in these tests may open, close, focus or drive a tab
+there.
 """
-import contextlib
+import itertools
 import os
-import sys
 import time
 import types
 
@@ -20,233 +13,315 @@ import pytest
 
 from browser_harness import second_window as sw
 
-
-@contextlib.contextmanager
-def _null_mutex(*a, **k):
-    """Stand-in for _state_mutex: these tests are single-process."""
-    yield
+USER_WID = 100
+OTHER_PID = 424242
 
 
-@pytest.fixture(autouse=True)
-def _clean_snapshot_flag(monkeypatch):
-    """_LAST_LIST_DROPPED is module state; keep tests from leaking it into each
-    other. Default is 0 = complete snapshot."""
-    monkeypatch.setattr(sw, "_LAST_LIST_DROPPED", 0)
+class FakeBrowser:
+    def __init__(self):
+        self.windows = {USER_WID: ["u1", "u2"]}
+        self.pages = {
+            "u1": {"url": "https://www.bilibili.com/video/1", "title": "video", "doc": 1},
+            "u2": {"url": "https://mail.example.org/", "title": "mail", "doc": 1},
+        }
+        self.sessions = {}
+        self.closed, self.clicks, self.bounds, self.activated = [], [], [], []
+        self.ext_calls = []
+        self.ax_nodes = []
+        self._ids = itertools.count(1)
 
-MAIN, SECOND = 111, 222
+    # -- topology --
+    def add_window(self, urls):
+        wid = 1000 + next(self._ids)
+        self.windows[wid] = []
+        for url in urls:
+            self.add_tab(wid, url)
+        return wid
 
-USER_TABS = [("t1", "https://www.huya.com/l"), ("t2", "https://www.bilibili.com/")]
-CLEAN_TABS = [("t3", "about:blank")]
-# Tabs that matched NOTHING in USER_DOMAINS before the fix — the exact shape that
-# let the main window pass the guard.
-BLOCKLIST_EVADING_TABS = [
-    ("t1", "https://m365.cloud.microsoft/chat"),
-    ("t2", "http://100.86.104.62:8090/admin/dashboard"),
-]
+    def add_tab(self, wid, url):
+        tid = f"t{next(self._ids)}"
+        self.windows[wid].append(tid)
+        self.pages[tid] = {"url": url, "title": "", "doc": 1}
+        return tid
 
+    def window_of(self, tid):
+        return next((w for w, tids in self.windows.items() if tid in tids), None)
 
-@pytest.fixture
-def detect(monkeypatch):
-    """Drive detect_second_window() against fake windows and a fake extension."""
+    def move(self, tid, wid):
+        self.windows[self.window_of(tid)].remove(tid)
+        self.windows[wid].append(tid)
 
-    def _run(cdp_windows, ext_focused, pinned=None):
-        monkeypatch.setattr(sw, "_list_windows", lambda: cdp_windows)
-        monkeypatch.setattr(
-            sw, "_load_state",
-            lambda: {"pinned_second_window_id": pinned} if pinned else {})
-        monkeypatch.setattr(sw, "_save_state", lambda state: None)
+    def tab_of(self, sid):
+        tid = self.sessions.get(sid)
+        if tid not in self.pages:
+            raise RuntimeError("Session with given id not found")
+        return tid
 
-        # detect_second_window does `from . import bh_extension_client as ext`
-        # inside the function body, so patch the module in sys.modules.
-        fake = types.ModuleType("browser_harness.bh_extension_client")
-        fake.start_server_if_needed = lambda *a, **k: None
-        fake.is_available = lambda: True
-        fake.send_command = lambda cmd, **kw: (
-            [{"id": w, "focused": (w == ext_focused)} for w in cdp_windows]
-            if cmd == "list_windows" else None
-        )
-        monkeypatch.setitem(sys.modules, "browser_harness.bh_extension_client", fake)
-
-        return sw.detect_second_window()
-
-    return _run
-
-
-def test_prefers_clean_window_over_user_window(detect):
-    wid, _ = detect({MAIN: USER_TABS, SECOND: CLEAN_TABS}, ext_focused=MAIN)
-    assert wid == SECOND
-
-
-def test_pin_short_circuits_heuristics(detect):
-    wid, _ = detect({MAIN: USER_TABS, SECOND: CLEAN_TABS},
-                    ext_focused=MAIN, pinned=SECOND)
-    assert wid == SECOND
-
-
-def test_refuses_when_every_window_holds_user_content(detect):
-    """Better to raise and let the caller spawn than to pollute."""
-    with pytest.raises(RuntimeError, match="Refusing to spawn"):
-        detect({MAIN: BLOCKLIST_EVADING_TABS, SECOND: BLOCKLIST_EVADING_TABS},
-               ext_focused=MAIN)
-
-
-def test_never_returns_extension_identified_main_window(detect):
-    """Extension says MAIN is focused, so MAIN is authoritatively the user's."""
-    result = detect({MAIN: BLOCKLIST_EVADING_TABS}, ext_focused=MAIN)
-    assert result[0] != MAIN, "detect handed back the user's main window"
-
-
-def test_main_window_not_picked_when_it_is_the_only_other_candidate(detect):
-    """The actual 2026-07-30 regression.
-
-    Two windows exist. The extension flags MAIN as focused, so the only other
-    candidate is SECOND — but here SECOND is *also* full of user content, which
-    is what the incident looked like (both windows had the sub2api panel open).
-    detect must raise rather than pick either one; the caller spawns a clean
-    window. Before the fix the Tailscale-addressed panel was absent from
-    USER_DOMAINS, both windows scored as work, and a tab was inserted.
-    """
-    with pytest.raises(RuntimeError, match="Refusing to spawn"):
-        detect({MAIN: BLOCKLIST_EVADING_TABS, SECOND: BLOCKLIST_EVADING_TABS},
-               ext_focused=MAIN)
-
-
-def test_single_window_declines_early(detect):
-    """One window total means there is no second window to find."""
-    assert detect({MAIN: CLEAN_TABS}, ext_focused=MAIN) == (None, None)
-
-
-def test_dead_pin_is_dropped_without_falling_back_to_main(detect):
-    stale = 999
-    result = detect({MAIN: BLOCKLIST_EVADING_TABS}, ext_focused=MAIN, pinned=stale)
-    assert result[0] != MAIN
-
-
-@pytest.mark.parametrize("url", [
-    "http://100.86.104.62:8090/admin/dashboard",
-    "http://127.0.0.1:8090/admin",
-    "https://www.bilibili.com/video/BV1",
-    "https://www.huya.com/l",
-])
-def test_user_surfaces_are_recognised(url):
-    """The sub2api panel is the user's, over loopback AND over Tailscale."""
-    assert sw._count_user_hits([url]) > 0, f"{url} not recognised as user content"
-
-
-# ---------- _assert_landed_in: the one check that does not rely on guessing ----------
-
-@pytest.fixture
-def fake_cdp(monkeypatch):
-    """Stub cdp() and record every call, so we can assert on cleanup."""
-    calls = []
-
-    def _install(window_for_target, closes_ok=True):
-        def fake(method, **kw):
-            calls.append((method, kw))
+    # -- CDP --
+    def cdp(self, method, session_id=None, _response_timeout=None, **p):
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"targetId": t, "type": "page", "url": v["url"], "title": v["title"]}
+                                    for t, v in self.pages.items()]}
+        if method in ("Browser.getWindowForTarget", "Target.getTargetInfo", "Target.attachToTarget",
+                      "Target.closeTarget", "Target.activateTarget"):
+            tid = p.get("targetId")
+            if tid not in self.pages:
+                raise RuntimeError("No target with given id found")
             if method == "Browser.getWindowForTarget":
-                if isinstance(window_for_target, Exception):
-                    raise window_for_target
-                return {"windowId": window_for_target}
-            if method == "Target.closeTarget":
-                if not closes_ok:
-                    raise RuntimeError("close failed")
+                return {"windowId": self.window_of(tid)}
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"targetId": tid, "type": "page", **self.pages[tid]}}
+            if method == "Target.attachToTarget":
+                sid = f"s{next(self._ids)}"
+                self.sessions[sid] = tid
+                return {"sessionId": sid}
+            if method == "Target.activateTarget":
+                self.activated.append(tid)
                 return {}
+            self.closed.append(tid)
+            self.windows[self.window_of(tid)].remove(tid)
+            del self.pages[tid]
             return {}
-        monkeypatch.setattr(sw, "cdp", fake)
-        return calls
+        if method == "Target.detachFromTarget":
+            self.sessions.pop(p.get("sessionId"), None)
+            return {}
+        if method == "Target.createTarget":
+            wid = self.add_window([p["url"]]) if p.get("newWindow") else USER_WID
+            if wid == USER_WID:
+                self.add_tab(USER_WID, p["url"])
+            return {"targetId": self.windows[wid][-1]}
+        if method == "Browser.setWindowBounds":
+            self.bounds.append((p["windowId"], p["bounds"]))
+            return {}
+        tid = self.tab_of(session_id) if session_id else None
+        page = self.pages.get(tid, {})
+        if method == "Page.navigate":
+            page.update(url=p["url"], doc=page["doc"] + 1)
+            return {"frameId": "f", "loaderId": "l"}
+        if method == "Runtime.evaluate":
+            expr = p["expression"]
+            if expr.startswith("window.open("):
+                url = expr.split('"')[1]
+                self.add_tab(self.window_of(tid), url)
+                return {"result": {}}
+            if expr == "performance.timeOrigin":
+                return {"result": {"value": page["doc"]}}
+            if expr == "[performance.timeOrigin, document.readyState]":
+                return {"result": {"value": [page["doc"], "complete"]}}
+            return {"result": {"type": "undefined"}}
+        if method == "Input.dispatchMouseEvent":
+            self.clicks.append((tid, p["type"], p["x"], p["y"]))
+            return {}
+        if method == "Accessibility.getFullAXTree":
+            return {"nodes": self.ax_nodes}
+        if method == "DOM.resolveNode":
+            return {"object": {"objectId": f"obj-{p['backendNodeId']}"}}
+        if method == "DOM.getContentQuads":
+            return {"quads": [[10, 20, 30, 20, 30, 40, 10, 40]]}
+        if method == "Runtime.callFunctionOn":
+            return {"result": {"value": "filled"}}
+        return {}
 
-    return _install
+    # -- companion extension --
+    def ext_send(self, action, timeout=None, **p):
+        self.ext_calls.append((action, p))
+        if action == "create_window":
+            wid = self.add_window([p["url"]])
+            return {"ok": True, "windowId": wid}
+        if action == "create_tab":
+            tid = self.add_tab(p["windowId"], p["url"])
+            return {"tabId": int(tid[1:]), "windowId": p["windowId"]}
+        return {"ok": True}
+
+    def daemon(self, req, response_timeout=None):
+        """Stand-in for helpers._raw_send (daemon metas only)."""
+        return {"targetId": "u1"} if req.get("meta") == "current_tab" else {}
 
 
-def test_assert_landed_in_accepts_correct_window(fake_cdp):
-    calls = fake_cdp(window_for_target=SECOND)
-    sw._assert_landed_in("tid-1", SECOND)
-    assert not [c for c in calls if c[0] == "Target.closeTarget"], \
-        "must not close a tab that landed correctly"
+@pytest.fixture
+def chrome(tmp_path, monkeypatch):
+    b = FakeBrowser()
+    monkeypatch.setattr(sw, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(sw, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sw, "REF_DIR", tmp_path / "refs")
+    monkeypatch.setattr(sw, "_STATE_LOCK_PATH", tmp_path / "state.lock")
+    monkeypatch.setattr(sw, "_SPAWN_LOCK_PATH", tmp_path / "spawn.lock")
+    monkeypatch.setattr(sw, "cdp", b.cdp)
+    monkeypatch.setattr(sw, "_raw_send", b.daemon)
+    ext = types.SimpleNamespace(send_command=b.ext_send)
+    b.ext = ext
+    monkeypatch.setattr(sw, "_extension", lambda wait=5.0: b.ext)
+    monkeypatch.setattr(sw, "_owner_alive", lambda owner: True)
+    monkeypatch.setattr(sw, "_pid_alive", lambda pid: pid in (os.getpid(), OTHER_PID))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "me")
+    for name, value in (("_SESSIONS", {}), ("_EXTRA_SESSIONS", set()), ("_BOUND", {"tid": None}),
+                        ("_DAEMON_REPOINTED", [False]), ("_EXIT_REGISTERED", [True]),
+                        ("_SPAWNED", set()), ("_NAVIGATED", set()), ("_LAST_TOUCH", {}),
+                        ("_WINDOW_CACHE", {})):
+        monkeypatch.setattr(sw, name, value)
+    return b
 
 
-def test_assert_landed_in_closes_and_raises_on_wrong_window(fake_cdp):
-    """A tab in the user's window must be closed, not merely reported."""
-    calls = fake_cdp(window_for_target=MAIN)
-    with pytest.raises(RuntimeError, match="landed in window"):
-        sw._assert_landed_in("tid-stray", SECOND)
-    closed = [kw["targetId"] for m, kw in calls if m == "Target.closeTarget"]
-    assert closed == ["tid-stray"], "stray tab left behind in the user's window"
+def _state():
+    return sw._load_state()
 
 
-def test_assert_landed_in_treats_unverifiable_as_failure(fake_cdp):
-    """If Chrome won't say where the tab is, assume the worst and clean up."""
-    calls = fake_cdp(window_for_target=RuntimeError("cdp down"))
+def _set_records(*records):
+    s = _state()
+    s["agent_tabs"] = list(records)
+    sw._save_state(s)
+
+
+# ---------- the agent window ----------
+
+def test_window_is_never_guessed_from_content(chrome):
+    """A window that looks like an old agent window is still not ours."""
+    lookalike = chrome.add_window([f"{sw.AGENT_SPAWN_URL}&bh-nonce=old"])
+    wid = sw.ensure_agent_window()
+    assert wid not in (USER_WID, lookalike)
+    assert chrome.ext_calls[0] == ("create_window", {
+        "url": chrome.pages[chrome.windows[wid][0]]["url"], "state": "minimized", "focused": False})
+
+
+def test_window_is_reused_while_its_anchor_lives(chrome):
+    wid = sw.ensure_agent_window()
+    assert sw.ensure_agent_window() == wid
+    assert [c for c, _ in chrome.ext_calls].count("create_window") == 1
+
+
+def test_window_is_found_again_after_its_id_changes(chrome):
+    """Chrome gives restored windows new ids; the anchor URL still names ours."""
+    wid = sw.ensure_agent_window()
+    anchor = chrome.windows[wid][0]
+    new_wid = chrome.add_window([])
+    chrome.move(anchor, new_wid)
+    assert sw.ensure_agent_window() == new_wid
+
+
+def test_cdp_fallback_minimizes_the_new_window(chrome):
+    chrome.ext = None
+    wid = sw.ensure_agent_window()
+    assert (wid, {"windowState": "minimized"}) in chrome.bounds
+
+
+# ---------- agent tabs and leases ----------
+
+def test_new_tab_opens_in_the_agent_window_without_activation(chrome):
+    tid = sw.ensure_agent_tab()
+    wid = sw.ensure_agent_window()
+    assert chrome.window_of(tid) == wid
+    action, params = chrome.ext_calls[-1]
+    assert action == "create_tab" and params["windowId"] == wid and params["active"] is False
+
+
+def test_parallel_process_does_not_get_a_busy_tab(chrome):
+    wid = sw.ensure_agent_window()
+    busy = chrome.add_tab(wid, "https://site.example/a")
+    _set_records({"tid": busy, "claimed_by": "session:me", "lease_pid": OTHER_PID,
+                  "last_access": time.time()})
+    assert sw.ensure_agent_tab() != busy
+
+
+def test_same_session_gets_its_free_tab_back(chrome):
+    wid = sw.ensure_agent_window()
+    mine = chrome.add_tab(wid, "https://site.example/page")
+    _set_records({"tid": mine, "claimed_by": "session:me", "lease_pid": 999999,
+                  "last_access": time.time()})
+    assert sw.ensure_agent_tab() == mine
+    assert not [c for c, _ in chrome.ext_calls if c == "create_tab"]
+
+
+def test_other_live_session_keeps_its_idle_tab(chrome):
+    wid = sw.ensure_agent_window()
+    theirs = chrome.add_tab(wid, "https://site.example/theirs")
+    _set_records({"tid": theirs, "claimed_by": "session:other", "lease_pid": None,
+                  "last_access": time.time()})
+    assert sw.ensure_agent_tab() != theirs
+
+
+def test_tab_moved_to_the_user_window_is_left_alone(chrome):
+    wid = sw.ensure_agent_window()
+    tab = chrome.add_tab(wid, "https://site.example/kept")
+    _set_records({"tid": tab, "claimed_by": "session:me", "last_access": time.time()})
+    chrome.move(tab, USER_WID)
+    assert sw.ensure_agent_tab() != tab
+    assert tab not in chrome.closed
+
+
+def test_prefer_url_picks_the_matching_tab(chrome):
+    wid = sw.ensure_agent_window()
+    a = chrome.add_tab(wid, "https://a.example/")
+    b = chrome.add_tab(wid, "https://m365.cloud.microsoft/chat")
+    now = time.time()
+    _set_records({"tid": a, "claimed_by": "session:me", "last_access": now},
+                 {"tid": b, "claimed_by": "session:me", "last_access": now - 100})
+    assert sw.ensure_agent_tab(prefer_url="m365.cloud.microsoft") == b
+
+
+# ---------- pruning ----------
+
+def test_prune_closes_only_free_agent_tabs(chrome):
+    wid = sw.ensure_agent_window()
+    now = time.time()
+    busy = chrome.add_tab(wid, "https://site.example/busy")
+    old = chrome.add_tab(wid, "https://site.example/old")
+    new = chrome.add_tab(wid, "https://site.example/new")
+    _set_records({"tid": busy, "lease_pid": OTHER_PID, "last_access": now - 50},
+                 {"tid": old, "last_access": now - 100},
+                 {"tid": new, "last_access": now})
+    sw.prune_agent_tabs(max_n=1)
+    assert old in chrome.closed and busy not in chrome.closed
+    assert not set(chrome.closed) & {"u1", "u2"}
+
+
+def test_prune_reaps_only_old_lost_placeholders_in_the_agent_window(chrome):
+    wid = sw.ensure_agent_window()
+    old_ms = int((time.time() - 600) * 1000)
+    new_ms = int(time.time() * 1000)
+    lost_old = chrome.add_tab(wid, f"{sw.AGENT_SPAWN_URL}&bh-nonce=pid-1-{old_ms}-aa")
+    lost_new = chrome.add_tab(wid, f"{sw.AGENT_SPAWN_URL}&bh-nonce=pid-1-{new_ms}-bb")
+    user_copy = chrome.add_tab(USER_WID, f"{sw.AGENT_SPAWN_URL}&bh-nonce=pid-1-{old_ms}-cc")
+    sw.prune_agent_tabs()
+    assert lost_old in chrome.closed
+    assert lost_new not in chrome.closed and user_copy not in chrome.closed
+
+
+# ---------- spawn verification ----------
+
+def test_assert_landed_in_closes_a_tab_in_the_wrong_window(chrome):
+    stray = chrome.add_tab(USER_WID, "https://x.example/")
+    with pytest.raises(RuntimeError, match="not in the agent window"):
+        sw._assert_landed_in(stray, 999)
+    assert stray in chrome.closed
+
+
+def test_assert_landed_in_treats_unverifiable_as_failure(chrome):
     with pytest.raises(RuntimeError, match="cannot confirm"):
-        sw._assert_landed_in("tid-unknown", SECOND)
-    assert [kw["targetId"] for m, kw in calls if m == "Target.closeTarget"] == ["tid-unknown"]
+        sw._assert_landed_in("gone", 999)
 
 
-def test_assert_landed_in_still_raises_when_cleanup_fails(fake_cdp):
-    fake_cdp(window_for_target=MAIN, closes_ok=False)
-    with pytest.raises(RuntimeError, match="landed in window"):
-        sw._assert_landed_in("tid-stray", SECOND)
-
-
-# ---------- prune_agent_tabs must never close the user's tabs ----------
-
-def test_prune_only_reaps_tabs_carrying_our_marker(monkeypatch):
-    """The second window may double as a window the user works in.
-
-    Regression: prune used to treat "in the pinned window, not in state, not
-    about:blank" as reapable — i.e. exactly the user's own tabs. With more than
-    max_n of them open it silently closed the overflow.
-    """
-    pinned = SECOND
-    user_tabs = [(f"user-{i}", f"https://news.example.com/{i}", "news") for i in range(6)]
-    ours = [("ours-1", f"https://example.com/?{sw.AGENT_TAB_MARKER}=1&bh-nonce=x", "")]
-    monkeypatch.setattr(sw, "_list_windows", lambda: {pinned: user_tabs + ours})
-    monkeypatch.setattr(sw, "_load_state",
-                        lambda: {"pinned_second_window_id": pinned, "agent_tabs": []})
-    monkeypatch.setattr(sw, "_save_state", lambda s: None)
-    monkeypatch.setattr(sw, "_state_mutex", _null_mutex)
-
-    closed = []
-    monkeypatch.setattr(sw, "cdp", lambda method, **kw: (
-        closed.append(kw.get("targetId")) if method == "Target.closeTarget" else None) or {})
-
-    sw.prune_agent_tabs(max_n=2)  # 7 tabs vs cap 2 → old code would close 5
-
-    assert all(t.startswith("ours-") for t in closed), \
-        f"prune closed the user's tabs: {[t for t in closed if not t.startswith('ours-')]}"
-
-
-# ---------- lock ownership: a slow holder must not lose its lock ----------
+# ---------- locks and pids ----------
 
 def test_lock_holder_alive_reads_the_recorded_pid(tmp_path, monkeypatch):
     lock = tmp_path / "x.lock"
     lock.write_text(f"{os.getpid()}\n{time.time()}", encoding="utf-8")
     assert sw._lock_holder_alive(lock) is True
-
     lock.write_text("999999999\n0", encoding="utf-8")
     monkeypatch.setattr(sw, "_pid_alive", lambda pid: pid == os.getpid())
-    assert sw._lock_holder_alive(lock) is False, \
-        "a provably dead holder should be reapable"
+    assert sw._lock_holder_alive(lock) is False
 
 
 def test_unreadable_lock_is_treated_as_held(tmp_path):
-    """Can't verify → don't steal. Age gating already limits the damage."""
     lock = tmp_path / "x.lock"
     lock.write_text("not-a-pid", encoding="utf-8")
     assert sw._lock_holder_alive(lock) is True
 
 
 def test_release_leaves_a_reassigned_lock_alone(tmp_path):
-    """The bug this prevents: our finally: deleting somebody else's lock.
-
-    Sequence: we hold the lock, we stall, a reaper decides we're dead and takes
-    it, then we wake up and run our finally. Deleting it there would let a third
-    process in while the reaper is still inside its critical section.
-    """
     lock = tmp_path / "x.lock"
-    lock.write_text("424242\n0", encoding="utf-8")  # someone else's pid
+    lock.write_text("424242\n0", encoding="utf-8")
     sw._release_lock_if_mine(lock)
-    assert lock.exists(), "released a lock that had been reassigned"
+    assert lock.exists()
 
 
 def test_release_removes_our_own_lock(tmp_path):
@@ -256,110 +331,159 @@ def test_release_removes_our_own_lock(tmp_path):
     assert not lock.exists()
 
 
-# ---------- _pid_alive: uncertainty must read as alive ----------
-
-def test_pid_alive_self():
+def test_pid_alive_self_and_falsy():
     assert sw._pid_alive(os.getpid()) is True
-
-
-def test_pid_alive_rejects_falsy():
-    assert sw._pid_alive(0) is False
-    assert sw._pid_alive(None) is False
+    assert sw._pid_alive(0) is False and sw._pid_alive(None) is False
 
 
 def test_pid_alive_says_alive_when_it_cannot_tell(monkeypatch):
-    """Docstring promised conservative-on-uncertainty; implementation didn't.
-
-    A live process at a different integrity level denies OpenProcess, and the old
-    code read that denial as "dead" — which let callers steal its lock and
-    reclaim its tabs.
-    """
     if os.name != "nt":
         pytest.skip("windows-specific path")
-
     import ctypes
-    ERROR_ACCESS_DENIED = 5
 
     class FakeK32:
         def SetLastError(self, _): pass
-        def OpenProcess(self, *a): return 0          # denied
-        def GetLastError(self): return ERROR_ACCESS_DENIED
-    monkeypatch.setattr(ctypes, "windll",
-                        types.SimpleNamespace(kernel32=FakeK32()))
-    assert sw._pid_alive(4) is True, "access-denied must not read as dead"
+        def OpenProcess(self, *a): return 0
+        def GetLastError(self): return 5  # ERROR_ACCESS_DENIED
+    monkeypatch.setattr(ctypes, "windll", types.SimpleNamespace(kernel32=FakeK32()))
+    assert sw._pid_alive(4) is True
 
 
-# ---------- fail-closed on incomplete data ----------
+# ---------- safe-mode request policy ----------
 
-def test_detect_refuses_to_score_an_incomplete_snapshot(detect, monkeypatch):
-    """One CDP hiccup must not walk past the blocklist.
-
-    _list_windows drops tabs whose window it can't resolve. If the dropped tab
-    was the bilibili one, the user's main window scores as user-content-free and
-    becomes an eligible candidate. So a partial snapshot disqualifies scoring.
-    """
-    monkeypatch.setattr(sw, "_LAST_LIST_DROPPED", 2)
-    assert detect({MAIN: USER_TABS, SECOND: CLEAN_TABS}, ext_focused=MAIN) == (None, None)
-
-
-def test_list_windows_reports_dropped_tabs(monkeypatch):
-    def fake_cdp(method, **kw):
-        if method == "Target.getTargets":
-            return {"targetInfos": [
-                {"type": "page", "targetId": "ok", "url": "https://a.example", "title": ""},
-                {"type": "page", "targetId": "bad", "url": "https://b.example", "title": ""},
-            ]}
-        if method == "Browser.getWindowForTarget":
-            if kw["targetId"] == "bad":
-                raise RuntimeError("cannot resolve")
-            return {"windowId": SECOND}
-        return {}
-
-    monkeypatch.setattr(sw, "cdp", fake_cdp)
-    windows = sw._list_windows()
-    assert windows == {SECOND: [("ok", "https://a.example", "")]}
-    assert sw._LAST_LIST_DROPPED == 1, "unplaceable tab not reported"
+def _forward(chrome, sent=None):
+    def forward(req):
+        if sent is not None:
+            sent.append(req)
+        if req.get("meta"):
+            return chrome.daemon(req)
+        return {"result": chrome.cdp(req["method"], session_id=req.get("session_id"), **req["params"])}
+    return forward
 
 
-def test_orphan_in_unknown_window_is_not_adopted(monkeypatch):
-    """`second_window_tids is None` means "couldn't check", not "empty window".
+def _policy(chrome, method, sent=None, **params):
+    return sw.request_policy({"method": method, "params": params, "session_id": None},
+                             _forward(chrome, sent))
 
-    Behavioural check: an unclaimed record whose tab is live but whose window
-    membership cannot be established must NOT be adopted. The old guard
-    (`not second_window_tids or tid in second_window_tids`) evaporated in exactly
-    that case, degrading into "adopt an orphan from any window" — the user's
-    included. Here _list_windows raises, so membership is unknowable; the orphan
-    must be passed over and a fresh spawn attempted instead.
-    """
-    orphan_tid = "orphan-1"
-    state = {"pinned_second_window_id": SECOND,
-             "agent_tabs": [{"tid": orphan_tid, "nonce": "n"}]}  # no claim → orphan
 
-    monkeypatch.setattr(sw, "detect_second_window", lambda: (SECOND, CLEAN_TABS))
-    monkeypatch.setattr(sw, "_load_state", lambda: state)
-    monkeypatch.setattr(sw, "_save_state", lambda s: None)
-    monkeypatch.setattr(sw, "_state_mutex", _null_mutex)
-    monkeypatch.setattr(sw, "_capture_user_main_window", lambda: None)
-    monkeypatch.setattr(sw, "_smart_focus_main_window", lambda snap: None)
-    monkeypatch.setattr(sw, "prune_agent_tabs", lambda **k: 0)
-    monkeypatch.setattr(sw, "_gc_orphan_claims", lambda *a, **k: None)
+def test_sessionless_page_call_runs_on_the_agent_tab(chrome):
+    sent = []
+    _policy(chrome, "Input.dispatchMouseEvent", sent, type="mousePressed", x=1, y=2)
+    tid = sw._BOUND["tid"]
+    assert chrome.window_of(tid) == sw.ensure_agent_window()
+    assert chrome.sessions[sent[-1]["session_id"]] == tid
+    assert chrome.clicks == [(tid, "mousePressed", 1, 2)]
 
-    def boom():
-        raise RuntimeError("cannot list windows")
-    monkeypatch.setattr(sw, "_list_windows", boom)
 
-    # The orphan's tab is live, so only the membership guard can rule it out.
-    def fake_cdp(method, **kw):
-        if method == "Target.getTargets":
-            return {"targetInfos": [{"type": "page", "targetId": orphan_tid,
-                                     "url": "https://example.com/?bh-agent-tab=1"}]}
-        raise RuntimeError("spawn path not exercised in this test")
-    monkeypatch.setattr(sw, "cdp", fake_cdp)
+@pytest.mark.parametrize("method", ["Target.activateTarget", "Browser.close", "Browser.crash"])
+def test_focus_changes_and_browser_close_are_refused(chrome, method):
+    with pytest.raises(RuntimeError):
+        _policy(chrome, method, targetId="u1")
+    assert not chrome.activated
 
-    # Must not return the orphan. Any other outcome (exception from the spawn
-    # path we deliberately broke) is acceptable — the point is it wasn't adopted.
-    try:
-        got = sw.ensure_agent_tab(prefer_extension=False)
-    except Exception:
-        got = None
-    assert got != orphan_tid, "adopted an orphan whose window membership was unknown"
+
+def test_bring_to_front_is_ignored(chrome):
+    assert _policy(chrome, "Page.bringToFront") == {"result": {}}
+
+
+def test_create_target_opens_an_agent_tab(chrome):
+    tid = _policy(chrome, "Target.createTarget", url="about:blank")["result"]["targetId"]
+    assert chrome.window_of(tid) == sw.ensure_agent_window()
+    assert len(chrome.windows[USER_WID]) == 2
+
+
+@pytest.mark.parametrize("method", ["Target.closeTarget", "Target.attachToTarget"])
+def test_user_tabs_cannot_be_closed_or_attached(chrome, method):
+    with pytest.raises(RuntimeError, match="not a tab in the agent window"):
+        _policy(chrome, method, targetId="u1")
+    assert "u1" not in chrome.closed
+
+
+def test_window_bounds_of_the_user_window_are_refused(chrome):
+    with pytest.raises(RuntimeError):
+        _policy(chrome, "Browser.setWindowBounds", windowId=USER_WID, bounds={"windowState": "minimized"})
+
+
+def test_target_list_shows_only_agent_tabs(chrome):
+    tid = sw.ensure_agent_tab()
+    infos = _policy(chrome, "Target.getTargets")["result"]["targetInfos"]
+    assert [t["targetId"] for t in infos] == [tid]
+
+
+def test_current_tab_and_session_meta_name_the_agent_tab(chrome):
+    forward = _forward(chrome)
+    cur = sw.request_policy({"meta": "current_tab"}, forward)
+    assert cur["targetId"] == sw._BOUND["tid"] != "u1"
+    sid = sw.request_policy({"meta": "session"}, forward)["session_id"]
+    assert chrome.sessions[sid] == cur["targetId"]
+
+
+def test_switching_to_a_user_tab_is_refused(chrome):
+    with pytest.raises(RuntimeError):
+        sw.request_policy({"meta": "set_session", "session_id": "x", "target_id": "u1"}, _forward(chrome))
+
+
+def test_closed_tab_is_replaced_but_only_navigation_is_repeated(chrome):
+    first = sw.bound_tab()
+    chrome.cdp("Target.closeTarget", targetId=first)
+    _policy(chrome, "Page.navigate", url="https://site.example/")
+    second = sw._BOUND["tid"]
+    assert second != first and chrome.pages[second]["url"] == "https://site.example/"
+    chrome.cdp("Target.closeTarget", targetId=second)
+    with pytest.raises(RuntimeError, match="not repeated"):
+        _policy(chrome, "Input.dispatchMouseEvent", type="mousePressed", x=1, y=1)
+    assert not chrome.clicks
+
+
+def test_page_error_text_is_not_read_as_a_closed_tab():
+    assert not sw.is_target_gone(RuntimeError("JavaScript evaluation failed: Target closed"))
+    assert sw.is_target_gone(RuntimeError("No target with given id found"))
+
+
+def test_daemon_default_session_moves_off_the_user_tab(chrome, monkeypatch):
+    sent = []
+
+    def daemon(req, response_timeout=None):
+        sent.append(req)
+        return chrome.daemon(req)
+    monkeypatch.setattr(sw, "_raw_send", daemon)
+    sw.bound_tab()
+    moved = [r for r in sent if r.get("meta") == "set_session"]
+    wid, anchor = sw.find_agent_window()
+    assert moved and moved[0]["target_id"] == anchor
+
+
+# ---------- accessibility snapshot refs ----------
+
+def _ax(node_id, role, name, backend, children=(), parent=None):
+    n = {"nodeId": node_id, "role": {"value": role}, "name": {"value": name},
+         "backendDOMNodeId": backend, "childIds": list(children)}
+    if parent:
+        n["parentId"] = parent
+    return n
+
+
+def test_snapshot_refs_work_in_a_later_process_until_the_page_changes(chrome, monkeypatch):
+    tid = sw.ensure_agent_tab()
+    chrome.ax_nodes = [_ax("1", "RootWebArea", "", 1, ["2", "3"]),
+                       _ax("2", "button", "Sign in", 42, parent="1"),
+                       _ax("3", "generic", "", 43, parent="1")]
+    text = sw.snapshot_tree_agent(tid)
+    assert text == '@e1 button "Sign in"'
+    monkeypatch.setattr(sw, "_SESSIONS", {})  # a new process has no sessions yet
+    assert sw.ref_for_agent(tid, "sign in") == "@e1"
+    assert sw.click_ref_agent(tid, "@e1") == {"clicked": "@e1", "x": 20, "y": 30}
+    sw.navigate_agent(tid, "https://site.example/next")
+    with pytest.raises(RuntimeError, match="stale"):
+        sw.click_ref_agent(tid, "@e1")
+
+
+# ---------- exit cleanup ----------
+
+def test_exit_closes_unused_placeholders_and_releases_leases(chrome):
+    unused = sw.ensure_agent_tab()
+    used = sw.new_agent_tab("https://site.example/kept")
+    sw._exit_cleanup()
+    assert unused in chrome.closed and used not in chrome.closed
+    rec = next(r for r in _state()["agent_tabs"] if r["tid"] == used)
+    assert rec["lease_pid"] is None
