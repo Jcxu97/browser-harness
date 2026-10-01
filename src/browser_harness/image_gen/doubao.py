@@ -12,7 +12,7 @@ Pipeline:
 1. Open / reuse Doubao chat in second window (logged-in profile).
 2. Click "图像生成" pill so the Slate prompt editor is visible.
 3. Inject prompt via CDP `Input.insertText` (Slate-friendly IME path).
-4. Click the send button (36×36 SVG-only button, x>1500 y>700).
+4. Click the send button (`data-testid="chat_input_send_button"`).
 5. Poll for 4 unique `rc_gen_image/{id}` thumbnails.
 6. For each thumbnail: open viewer → walk React fiber for `realImageInfo`
    → force-load both URLs in-page (`new Image().src = ...`) → intercept
@@ -33,6 +33,7 @@ from pathlib import Path
 from ..helpers import cdp, drain_events
 from ..second_window import (
     ensure_agent_tab,
+    navigate_agent,
     _attach,
     _detach,
 )
@@ -128,9 +129,16 @@ def _inject_prompt(tid: str, prompt: str) -> None:
 
 
 def _click_send(tid: str) -> None:
-    """Click the 36×36 svg-only button at the right edge below the editor."""
+    """Click the send button. Without its test id, click the 36×36 svg-only
+    button at the right edge below the editor."""
     r = _eval(tid, """
 JSON.stringify((() => {
+  // Page zoom and window size move the button, so the test id goes first.
+  const send = document.querySelector('[data-testid="chat_input_send_button"], #flow-end-msg-send');
+  if (send && send.offsetParent !== null && send.getAttribute('aria-disabled') !== 'true') {
+    send.click();
+    return {ok:true, n:1};
+  }
   const btns = [...document.querySelectorAll('button, [role="button"]')]
     .filter(b => {
       if (b.offsetParent === null) return false;
@@ -341,11 +349,8 @@ def generate(prompt: str, save_dir: str, max_retry: int = 1) -> dict:
     last_err: Exception | None = None
     for attempt in range(max_retry + 1):
         try:
-            sid = _attach(tid)
-            try:
-                cdp("Page.navigate", session_id=sid, url=DOUBAO_URL)
-            finally:
-                _detach(sid)
+            # navigate_agent also keeps the new-tab links of the page in this tab.
+            navigate_agent(tid, DOUBAO_URL)
             time.sleep(3.5)
 
             _switch_to_image_mode(tid)
