@@ -127,7 +127,8 @@ def is_enabled() -> bool:
 def status() -> dict:
     config = _load_config()
     env_disabled = _env_disabled()
-    enabled = not env_disabled and not bool(config.get("disabled"))
+    # Report the fork's hard off, and do not write an install id while off.
+    enabled = is_enabled()
     return {
         "enabled": enabled,
         "disabled_by_env": env_disabled,
