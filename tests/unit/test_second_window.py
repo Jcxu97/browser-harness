@@ -500,3 +500,22 @@ def test_send_keys_takes_a_named_key_as_one_key(chrome):
     chrome.keys.clear()
     sw.send_keys_agent(tid, "ab")
     assert [k for k in chrome.keys if k[0] == "keyDown"] == [("keyDown", "a"), ("keyDown", "b")]
+
+
+@pytest.mark.parametrize("first", ["browser_harness.second_window", "browser_harness.helpers",
+                                   "browser_harness.image_gen"])
+def test_safe_mode_installs_whatever_module_loads_first(first):
+    """Under pytest the policy is not installed, so run a real interpreter.
+    second_window imports helpers, and helpers installs a policy from
+    second_window: importing second_window first must not hit that cycle."""
+    import pathlib
+    import subprocess
+    import sys
+    src = str(pathlib.Path(__file__).resolve().parents[2] / "src")
+    code = (f"import {first}\n"
+            "import browser_harness.helpers as h\n"
+            "assert h._REQUEST_POLICY is not None\n")
+    env = {**os.environ, "PYTHONPATH": src}
+    env.pop("BH_SAFE_MODE", None)
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr

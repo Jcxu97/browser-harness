@@ -699,9 +699,15 @@ def _install_safe_mode():
     # must see the raw behavior.
     if os.environ.get("BH_SAFE_MODE", "1") == "0" or "pytest" in sys.modules:
         return
-    from . import second_window
     global _REQUEST_POLICY
-    _REQUEST_POLICY = second_window.request_policy
+
+    # Look the policy up per request: second_window imports this module, so a
+    # process that imports second_window first would meet a half-loaded module.
+    def _policy(req, forward):
+        from . import second_window
+        return second_window.request_policy(req, forward)
+
+    _REQUEST_POLICY = _policy
 
 
 _install_safe_mode()
