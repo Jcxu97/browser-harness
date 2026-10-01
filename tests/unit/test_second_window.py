@@ -26,6 +26,7 @@ class FakeBrowser:
         }
         self.sessions = {}
         self.closed, self.clicks, self.bounds, self.activated = [], [], [], []
+        self.keys = []
         self.ext_calls = []
         self.ax_nodes = []
         self._ids = itertools.count(1)
@@ -111,6 +112,9 @@ class FakeBrowser:
             return {"result": {"type": "undefined"}}
         if method == "Input.dispatchMouseEvent":
             self.clicks.append((tid, p["type"], p["x"], p["y"]))
+            return {}
+        if method == "Input.dispatchKeyEvent":
+            self.keys.append((p["type"], p.get("key") or p.get("text")))
             return {}
         if method == "Accessibility.getFullAXTree":
             return {"nodes": self.ax_nodes}
@@ -487,3 +491,12 @@ def test_exit_closes_unused_placeholders_and_releases_leases(chrome):
     assert unused in chrome.closed and used not in chrome.closed
     rec = next(r for r in _state()["agent_tabs"] if r["tid"] == used)
     assert rec["lease_pid"] is None
+
+
+def test_send_keys_takes_a_named_key_as_one_key(chrome):
+    tid = sw.ensure_agent_tab()
+    sw.send_keys_agent(tid, "Enter")
+    assert [k for k in chrome.keys if k[0] == "rawKeyDown"] == [("rawKeyDown", "Enter")]
+    chrome.keys.clear()
+    sw.send_keys_agent(tid, "ab")
+    assert [k for k in chrome.keys if k[0] == "keyDown"] == [("keyDown", "a"), ("keyDown", "b")]

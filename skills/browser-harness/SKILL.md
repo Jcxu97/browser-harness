@@ -24,15 +24,52 @@ print(eval_js("document.title"))
 PY
 ```
 
-- Invoke as browser-harness — it's on $PATH. No cd, no uv run.
+- Invoke as `browser-harness`. It is on $PATH. Do not cd, and do not use uv run.
 - Use the heredoc form for every multi-line command. It prevents shell quote mangling inside Python strings and JavaScript snippets.
-- **Safe-mode is default** (BH_SAFE_MODE=1): `goto / eval_js / snap / shot / click_at / type_text / send_keys / fill / upload / close_tab` and the bound `agent_tab` are pre-injected. They all operate on a pinned second Chrome window — never the user's active window. The legacy `new_tab(url) / goto_url(url)` names are shadowed to the same safe path, so old code keeps working but can no longer pollute the user's window.
-- **atexit cleanup**: when the BH process exits, any tab still on a BH spawn placeholder URL (`example.com/?bh-agent-tab=...`) is auto-closed. Tabs the agent navigated to a real URL are left alone for the next session to reuse. Disable with `BH_KEEP_PLACEHOLDERS=1`.
-- Tab cap `DEFAULT_MAX_AGENT_TABS=15` (was 25) — backstop only; primary GC is the atexit placeholder sweep.
-- Set `BH_SAFE_MODE=0` only if you genuinely need raw helpers that act on the focused tab (currently no task does).
-- `page_info()` and the other raw upstream helpers still exist and are traced, but
-  prefer the safe-mode names above — upstream's docs say "first navigation is
-  `new_tab(url)`", which in this fork is the shadowed legacy path.
+
+### Safe mode (this fork)
+
+Safe mode is always on. `BH_SAFE_MODE=0` is forbidden. Every CDP request goes
+through `second_window.request_policy`:
+
+1. BH owns one agent window in the user's daily Chrome (same profile, so the
+   user's logins work). BH opens it minimized and unfocused. Scripts cannot see
+   or change the user's own windows and tabs.
+2. Each browser-harness process works in its own agent tab. Two processes never
+   use the same tab at the same time, so parallel agents and subagents do not race.
+3. Every helper acts on that tab: the fork names below, upstream helpers such as
+   `js()`, `page_info()`, `click_at_xy()`, `type_text()`, `press_key()`,
+   `scroll()`, `wait_for_load()` and `capture_screenshot()`, and raw `cdp(...)`.
+4. `new_tab(url)` opens another agent tab and makes it current. `close_tab()`
+   closes the current agent tab. `list_tabs()` and `switch_tab()` see agent tabs only.
+5. The policy refuses `Target.activateTarget` and `Browser.close`, and ignores
+   `Page.bringToFront`. To let the user type a password, call `show_window()`.
+
+These names are pre-imported:
+
+| Name | Use |
+|---|---|
+| `goto(url)` | Navigate and wait for the load. Returns False on a load error or timeout. |
+| `snapshot()` | Accessibility tree of interactive nodes, one `@e` ref per line. |
+| `ref_for(text, role=None)` | Find a ref in the last snapshot of this tab. |
+| `click_ref(ref)`, `fill_ref(ref, value, submit=False)` | Act on a ref. |
+| `eval_js(expr)` | Run JavaScript. The result of a promise is awaited. |
+| `snap()` | Visible text of the page. |
+| `shot(path, full=False)` | Screenshot. |
+| `click_at(x, y)`, `send_keys(["Tab", "Enter"])`, `hotkey("Control+A")` | Raw input. |
+| `fill(selector, value)`, `upload(selector, paths)` | Forms and file inputs. |
+| `show_window()`, `hide_window()` | Show the agent window for a login, then hide it. |
+| `agent_tab` | Target id of the current agent tab. |
+
+Tab life cycle:
+
+1. When a process exits, BH closes its tabs that still show the start page
+   (`example.com/?bh-agent-tab=...`). Tabs that show a real page stay open, and
+   the same Claude session reuses them later. `BH_KEEP_PLACEHOLDERS=1` keeps the
+   start-page tabs too.
+2. The agent window keeps at most 15 agent tabs. Above that, BH closes the free
+   tabs that were used least recently.
+3. When you no longer need a page, call `close_tab()`.
 
 ## Local Chrome
 
@@ -41,20 +78,11 @@ no per-site, screenshot, or result-count limit that requires a new daemon.
 Chrome memory and page complexity are the practical limits. Reuse matching tabs
 with `list_tabs()` and `switch_tab()`.
 
-One daemon has one mutable attached/current tab. Many agents can share it when
-their browser operations are serialized: treat local Chrome as one shared
-browser lane while non-browser work continues in parallel. Sequential tab
-switching, input, and screenshot capture are safe. Do not create another local
-daemon merely because several agents exist.
-
-Two agents that switch tabs and act simultaneously can race, causing one to act
-on or capture the other's tab. For truly simultaneous interactive work, use
-separate remote browsers when Browser Use Cloud authentication is already
-available. Otherwise serialize browser operations through the default local
-daemon. A named local daemon is a last resort when simultaneous isolation is
-required, remote auth is unavailable or unsuitable, and the extra Chrome
-approval prompt is acceptable. It creates another controller and dedicated tab
-in the same local Chrome profile, not another Chrome profile or process.
+In this fork, each browser-harness process has its own agent tab and its own
+CDP session, so many agents can use the default daemon at the same time. They
+do not act on or capture each other's tabs. Do not create another local daemon
+because several agents exist. A named local daemon opens another browser-level
+CDP connection, and Chrome may show another Allow prompt.
 
 If the default daemon becomes stale, use its built-in reattachment/recovery
 first. A command timeout, truncated output, site change, closed tab, or new task
@@ -159,14 +187,14 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 
 ## Page Workflow
 
-- Prefer to find elements with the accessibility tree, not screenshots: `cdp("Accessibility.getFullAXTree")["nodes"]` has every element's role, name, and `backendDOMNodeId` — filter in Python before printing (it is thousands of nodes). Coordinates: `q = cdp("DOM.getBoxModel", backendNodeId=n)["model"]["content"]; x, y = sum(q[0::2])/4, sum(q[1::2])/4` (viewport px, ready for `click_at_xy`; negative/oversized means scroll first).
-- Clicking: AX node -> box center -> `click_at_xy(x, y)` -> verify with a targeted `js(...)`/`page_info()` check.
-- Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
-- After navigation, call `wait_for_load()`.
-- If the current tab is stale or internal, call `ensure_real_tab()`.
-- Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
+- Start with `snapshot()`, not a screenshot. It prints one line per interactive node, for example `@e7 button "Sign in"`. Pass `roles={"button", "link", "textbox"}` on a large page.
+- Act on a ref: `click_ref("@e7")`, `fill_ref("@e3", "text", submit=True)`. `ref_for("Sign in")` finds a ref by its name. Refs stay valid across browser-harness calls until the page navigates; after that, take a new snapshot.
+- Verify with a targeted `eval_js(...)` or `page_info()` check.
+- Use `shot()` and `click_at(x, y)` only when the target is not in the tree (canvas, video, images drawn by the page).
+- `goto(url)` waits for the load. After a click that navigates, call `wait_for_load()`.
+- Use `eval_js(...)` for DOM inspection or extraction when refs are the wrong tool.
 - When entering unusually long text, avoid slow per-character typing: find a faster page-appropriate input method, then verify the page kept the exact value.
-- Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
+- Login walls: the agent window uses the user's daily profile, so most sites are already signed in. When a page needs a password, MFA, or a consent click, call `show_window()`, ask the user to finish it, wait for their reply, then call `hide_window()`. Do not type passwords for the user.
 - Raw CDP is available with `cdp("Domain.method", ...)`.
   Pass CDP parameters as keywords: `cdp("Input.insertText", text="hello")`.
   The second positional argument is a session ID, not a parameters dictionary.
@@ -225,28 +253,28 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - uploads.md
 - viewport.md
 
-## Second-window agent mode
+## Agent window from Python code
 
-When the user's policy says automation must NOT disturb their main Chrome
-window (no tab steal, no focus theft), use the `second_window` module:
+Python modules (for example the image drivers) use `second_window` directly.
+The same policy applies.
 
 ```python
 from browser_harness.second_window import (
-    ensure_agent_tab, navigate_agent, snapshot_agent, screenshot_agent,
-    fill_agent, click_at_agent, save_as_pdf_agent, evaluate_agent,
+    ensure_agent_tab, navigate_agent, snapshot_tree_agent, click_ref_agent,
+    evaluate_agent, screenshot_agent, close_agent_tab,
 )
 
-tid = ensure_agent_tab()  # auto-detect/spawn user's second window
-navigate_agent(tid, url)
-text = snapshot_agent(tid)
+tid = ensure_agent_tab()              # lease a free agent tab, or open one
+navigate_agent(tid, "https://example.com")
+print(snapshot_tree_agent(tid))
 ```
 
-See `interaction-skills/second-window.md` for the full API surface and the
-optional zero-focus-steal Chrome extension companion at `extension/`.
+`interaction-skills/second-window.md` lists the full API, the state file, and
+the companion extension in `extension/`.
 
 ## Design Constraints
 
-- Coordinate clicks default. CDP mouse events pass through iframes/shadow/cross-origin at the compositor level.
+- Snapshot refs first. Coordinate clicks are the fallback; CDP mouse events pass through iframes/shadow/cross-origin at the compositor level.
 - Keep the connection model simple: use the default daemon, `BU_NAME`, `BU_CDP_URL`, `BU_CDP_WS`, or `start_remote_daemon(...)`.
 - Trusted orchestrators can set `BH_OPEN_LIVE_URL=0` while provisioning a Cloud
   daemon to keep its interactive live-view URL from being printed or opened.
@@ -272,65 +300,37 @@ Only applies when `BH_DOMAIN_SKILLS=1`. Otherwise ignore domain skills.
 
 When enabled, search `$BH_AGENT_WORKSPACE/domain-skills/<host>/` before inventing an approach. `goto_url(...)` returns up to 10 skill filenames for the navigated host.
 
-## Image generation (Doubao)
+If you learn anything non-obvious (a private API, stable selector, framework quirk, URL pattern, hidden wait, or site-specific trap), add it to `agent-workspace/domain-skills/<site>/`. Capture the durable shape of the site (the map, not the diary). Do not write pixel coordinates (they break on layout changes), task narration, or secrets. This repository is public.
 
-Triggers: "用豆包生成一张图" / "出张图" / "doubao_generate" / 用户给 prompt
-要求生成图片素材.
+## Image generation
+
+The drivers run in agent tabs and use the user's signed-in sessions. Pick the
+channel by the user's rule:
+
+1. Try M365 Copilot first. It is free and makes one 1024×1024 image.
+2. When Copilot fails, ask the user: Doubao (free, 4 images, 2 to 3 minutes)
+   or GPT image-2 (paid, 1 image, about 70 seconds).
+3. When the user names a channel, use it and do not ask.
 
 ```python
+from browser_harness.image_gen import copilot_generate, copilot_pick
 from browser_harness.image_gen import doubao_generate, doubao_pick
-
-session = doubao_generate(
-    "极简插画风格，一只橘猫坐在窗台上望向夜晚的城市灯光，柔和暖色调",
-    "<project>/assets/cat",  # 图保存目录
-)
-# session['fulls'] = 4 个清晰 PNG (1773×2364, 无水印, 无损双图合并)
-# 用 Read() 多模态预览,挑一张
-doubao_pick(session, idx=2, dst_path="<project>/assets/cat.png")  # 留这张,其余删
-```
-
-走第二 window agent tab,不抢用户主 Chrome 焦点。需要用户已登录豆包
-(cookies 自动复用)。整个流程 ~2-3 分钟 (排队 + 4 张图下载 + 合并)。
-
-水印去除原理:豆包返回两份 URL — `image_pre_watermark`(水印左上) +
-`image_dld_watermark`(水印右下),从 React fiber `realImageInfo` 提取后
-画布合并 → 真无损,无 inpaint 模糊。源码: `image_gen/doubao.py`,
-方案致谢 github.com/Qalxry/doubao-no-watermark.
-
-## Image generation (GPT image-2 via sub2api)
-
-**付费**通道。OpenAI 兼容 `/v1/images/generations`,model = `gpt-image-2`。
-单张 1024×1024 ≈ **65-70 秒 / ~1.4 MB / ~1756 image_tokens**。
-
-**Default behavior:** 生图请求触发时(出图/生成图片/给我画一张),agent
-**必须先问** "用免费的豆包还是 GPT image-2",不许默认选 GPT(贵)。
-默认走豆包。
-
-```python
 from browser_harness.image_gen import gpt_image_generate, gpt_image_pick
 
-# 需要 env: SUB2API_BASE, SUB2API_KEY
-session = gpt_image_generate(
-    prompt="A minimalist watercolor of a ginkgo leaf...",
-    save_dir="<project>/assets/leaf",
-    n=1, size="1024x1024",
-)
-# 同 doubao.generate 返回 shape: fulls/thumbnails/session_dir/usage/elapsed_sec
-gpt_image_pick(session, idx=0, dst_path="<project>/assets/leaf.png")
+session = copilot_generate("a ginkgo leaf, watercolor", "<project>/assets/leaf")
+session = doubao_generate("极简插画风格，一只橘猫坐在窗台上", "<project>/assets/cat")
+doubao_pick(session, idx=2, dst_path="<project>/assets/cat.png")  # keeps one, deletes the rest
 ```
 
-不走 second_window — 纯 HTTP `urllib`,跟主 Chrome 无关。Cloudflare 在
-sub2api 前面,**必须**带浏览器 User-Agent(模块默认带了),否则 HTTP 403 / CF 1010。
+Each call returns a dict. `session["fulls"]` holds the PNG paths. Look at them
+with Read before you pick one.
 
-何时走这条:用户点名 `gpt-image-2`、时间敏感(豆包要 2-3 分钟)、一次只要 1 张、
-要求商用稳定 API 路径。否则走豆包。
+Doubao serves two CDN copies of each image. `image_pre_watermark` has the mark
+at the top left, and `image_dld_watermark` has it at the bottom right. The
+driver merges the clean halves, so the result has no watermark and no
+inpainting. Credit: github.com/Qalxry/doubao-no-watermark.
 
-实测脚本 + Cloudflare 踩坑细节: `experiments/sub2api-gpt-image2/`。
-
-## Domain skills (opt-in)
-
-Only applies when `BH_DOMAIN_SKILLS=1`. Otherwise ignore — `agent-workspace/domain-skills/` is dormant and `goto_url` won't surface skill files.
-
-When enabled, search `agent-workspace/domain-skills/<host>/` before inventing an approach. `goto_url` returns up to 10 skill filenames for the navigated host.
-
-If you learn anything non-obvious — a private API, stable selector, framework quirk, URL pattern, hidden wait, or site-specific trap — open a PR to `agent-workspace/domain-skills/<site>/`. Capture the durable shape of the site (the map, not the diary). Don't write pixel coordinates (break on layout), task narration, or secrets — the directory is public.
+GPT image-2 does not use the browser. It calls the sub2api OpenAI-compatible
+`/v1/images/generations` endpoint and needs `SUB2API_BASE` and `SUB2API_KEY`.
+Cloudflare in front of sub2api refuses requests without a browser User-Agent.
+The module sends one. Test script and notes: `experiments/sub2api-gpt-image2/`.

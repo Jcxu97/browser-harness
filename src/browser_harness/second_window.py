@@ -1019,6 +1019,10 @@ def key_type_agent(agent_tid, text):
 
 
 def send_keys_agent(agent_tid, keys):
+    """keys: a list such as ["Tab", "a", "Enter"], or a string. A string that
+    names a key ("Enter") is that key; any other string is typed per character."""
+    if isinstance(keys, str):
+        keys = [keys] if keys in _VK_MAP else list(keys)
     for k in keys:
         if len(k) == 1:
             _call(agent_tid, "Input.dispatchKeyEvent", type="keyDown", text=k)

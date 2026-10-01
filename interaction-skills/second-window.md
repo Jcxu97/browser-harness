@@ -1,117 +1,153 @@
-# Second-window agent tabs
+# Agent window and agent tabs
 
-When the user's policy requires that automation **never disturbs** their main
-Chrome window, route all agent operations through their second window.
+In this fork, browser automation never disturbs the user's own Chrome windows.
+All automation runs in agent tabs inside one agent window that BH owns. The
+window is in the user's daily Chrome (same profile, port 9222), so the user's
+logins work.
 
-## Hard rule
+## Rules
 
-- agent tabs MUST live in the user's second Chrome window
-- main window (the one user is actively working in) is never touched
-- focus is never stolen during navigate / click / fill / screenshot / etc.
+1. The agent window opens minimized and unfocused, and it stays minimized.
+2. BH never activates a tab, raises a window, or brings Chrome to the front.
+   The one exception is `show_window()`, for a login that the user must finish.
+3. BH never closes, navigates, or reads the user's tabs.
+4. Each process works in its own agent tab.
 
-## Quick start
+## How BH finds its window
+
+BH opens the window with an anchor tab at
+`https://example.com/?bh-agent-window=<nonce>` and stores the nonce in the
+state file. The window that holds the anchor is the agent window. BH never
+guesses a window from tab counts or URLs. When the user closes the agent
+window, BH opens a new one on the next call.
+
+BH opens the window in this order:
+
+1. With the companion extension: `chrome.windows.create({focused: false, state: "minimized"})`.
+2. Without it: `Target.createTarget(newWindow=True, background=True, windowState="minimized")`,
+   then `Browser.setWindowBounds` with `windowState: "minimized"`.
+
+Agent tabs open with the extension (`chrome.tabs.create({windowId, active: false})`)
+or with `window.open` from the anchor tab. Each new tab has a nonce in its start
+URL (`example.com/?bh-agent-tab=1&bh-nonce=...`), so BH knows which tab it
+opened. When a new tab lands outside the agent window, BH closes it.
+
+## Leases
+
+The state file `~/.browser-harness/second-window-state.json` has one record
+per agent tab: `tid`, `claimed_by` (`session:<CLAUDE_CODE_SESSION_ID>` or
+`pid:<pid>`), `lease_pid`, `last_access` and `nonce`.
+
+`ensure_agent_tab()` picks the first match:
+
+1. a tab that this process already leases,
+2. a free tab that this Claude session claimed before,
+3. a free tab that nobody claimed,
+4. a new tab.
+
+A tab is busy while its `lease_pid` is alive and the tab was used in the last
+30 minutes. BH never gives a busy tab to another process. Each
+`browser-harness` call is a new Python process, so two subagents that run at
+the same time get different tabs. A file lock serializes all state changes.
+
+At exit, a process releases its leases, closes its tabs that still show the
+start page, and detaches its CDP sessions. Above 15 agent tabs,
+`prune_agent_tabs()` closes the free tabs that were used least recently. It
+also closes lost start-page tabs that are older than 60 seconds.
+
+## Request policy
+
+`helpers._send` passes every request to `second_window.request_policy`.
+
+| Request | Policy |
+|---|---|
+| Page commands without a session (`Page.*`, `Runtime.*`, `Input.*`, ...) | Run on the agent tab of this process. |
+| Requests with an explicit session | Forward. A script gets sessions only from the attach rule below. |
+| `Target.createTarget` | Open an agent tab instead, and return its targetId. |
+| `Target.closeTarget`, `Target.attachToTarget` | Agent tabs only. |
+| `Target.getTargets` | Show agent tabs only, without the anchor. |
+| `Browser.setWindowBounds` | The agent window only. |
+| `Target.activateTarget`, `Browser.close`, `Browser.crash*` | Refused. |
+| `Page.bringToFront` | Ignored. |
+| Daemon meta `current_tab`, `session`, `set_session` | Answered for the agent tab of this process. |
+
+At start, the daemon attaches its default session to the first page, which is
+a user tab. Each process moves that session to the anchor tab once, so no
+request without a session can reach a user tab.
+
+When the agent tab closes during a call, BH binds a new tab. Only
+`Page.navigate` repeats on the new tab. Other calls raise, because they would
+act on a different page.
+
+## API
+
+The functions take the agent tab id first.
+
+| Function | Use |
+|---|---|
+| `ensure_agent_tab(prefer_url=None)` | Lease a tab (see Leases). `prefer_url` picks a free tab whose URL contains it. |
+| `new_agent_tab(url=None)` | Open a new agent tab. |
+| `bound_tab()`, `bind(tid)` | The tab that gets requests without a session in this process. |
+| `navigate_agent(tid, url, timeout=15)` | Navigate and wait for the load. False on a load error or timeout. |
+| `snapshot_tree_agent(tid, interactive_only=True, roles=None)` | `@e` ref tree. Refs persist in `~/.browser-harness/refs/<tid>.json`. |
+| `ref_for_agent`, `click_ref_agent`, `fill_ref_agent` | Find a ref and act on it. |
+| `snapshot_agent(tid)` | Visible text of the page. |
+| `evaluate_agent(tid, expr)` | Run JavaScript. The result of a promise is awaited. |
+| `screenshot_agent(tid, path, full=False)`, `save_as_pdf_agent(tid, path)` | Capture the page. |
+| `click_at_agent`, `key_type_agent`, `send_keys_agent`, `hotkey_agent` | Input. |
+| `fill_agent(tid, selector, value)`, `upload_agent(tid, selector, paths)` | Forms and file inputs. |
+| `list_agent_tabs()`, `find_agent_tab(url_part)` | Agent tabs, with `mine` and `busy` flags. |
+| `close_agent_tab(tid)`, `close_agent_tabs_matching(url_part, keep=None)` | Close agent tabs. |
+| `show_window(tid=None)`, `hide_window()` | Show the agent window for a login, then minimize it. |
 
 ```python
 from browser_harness.second_window import (
-    ensure_agent_tab, navigate_agent, snapshot_agent, screenshot_agent,
-    save_as_pdf_agent, evaluate_agent, fill_agent, click_at_agent,
-    key_type_agent, send_keys_agent, hotkey_agent, upload_agent,
-    list_agent_tabs, find_agent_tab, close_agent_tab,
+    ensure_agent_tab, navigate_agent, snapshot_tree_agent, click_ref_agent,
+    fill_ref_agent, show_window, hide_window,
 )
 
-# Single entry point — auto-detect, auto-spawn, persistent reuse
 tid = ensure_agent_tab()
-
-navigate_agent(tid, "https://example.com")
-text = snapshot_agent(tid)
-screenshot_agent(tid, "/tmp/shot.png")
-save_as_pdf_agent(tid, "/tmp/page.pdf")
-fill_agent(tid, 'input[name="q"]', "search term")
-send_keys_agent(tid, ["Enter"])
-hotkey_agent(tid, "Ctrl+End")     # modifier chords: jump to doc end, select all, etc.
+navigate_agent(tid, "https://example.com/login")
+print(snapshot_tree_agent(tid))      # @e1 textbox "Email" ...
+fill_ref_agent(tid, "@e1", "me@example.com")
+show_window(tid)                     # the user types the password
+# ... wait for the user to say they are done ...
+hide_window()
 ```
 
-### send_keys vs hotkey (important)
+### send_keys vs hotkey
 
-`send_keys_agent(tid, [...])` presses each token **independently** with no held
-modifiers. `send_keys_agent(tid, "Control+End")` does NOT do Ctrl+End — it types
-the literal characters `Control+End` into the page. Use it only for standalone
-keys like `["Enter"]`, `["Tab"]`, `["ArrowDown"]`.
+`send_keys_agent(tid, ["Tab", "Enter"])` presses each key on its own, with no
+held modifier. A string is typed per character, except when the whole string
+names one key (`"Enter"`). `send_keys_agent(tid, "Control+End")` types the
+characters `Control+End`.
 
-For real keyboard shortcuts use `hotkey_agent(tid, chord)`, which holds the
-modifier(s) down while pressing the final key:
+For a shortcut, use `hotkey_agent(tid, chord)`. It holds the modifiers down
+while it presses the last key:
 
 ```python
-hotkey_agent(tid, "Ctrl+End")        # caret to end of document
-hotkey_agent(tid, "Ctrl+A")          # select all
-hotkey_agent(tid, "Shift+ArrowRight")# extend selection
-hotkey_agent(tid, "Ctrl+Shift+End")  # multi-modifier chords work too
+hotkey_agent(tid, "Control+End")       # caret to the end of the document
+hotkey_agent(tid, "Control+A")         # select all
+hotkey_agent(tid, "Shift+ArrowRight")  # extend the selection
+hotkey_agent(tid, "Control+Shift+End") # more than one modifier
 ```
 
-Modifiers: `Ctrl`/`Control`, `Shift`, `Alt`, `Meta`/`Cmd`/`Win`. The final key is
-either a single char (`a`, `1`) or a named key from the `_VK_MAP`
-(`End`, `Home`, `ArrowRight`, `Enter`, ...). This is the right tool for
-canvas-rendered editors (Google Docs, Sheets) where DOM editing is impossible.
+Modifiers are `Ctrl`/`Control`, `Shift`, `Alt` and `Meta`/`Cmd`/`Win`. The last
+key is one character (`a`, `1`) or a named key (`End`, `Home`, `ArrowRight`,
+`Enter`, ...). Use hotkeys for editors that draw on a canvas (Google Docs,
+Sheets), where DOM edits do not work.
 
-## How it works
+## Companion extension
 
-`ensure_agent_tab()` does (in order):
+The extension in `extension/` opens the window and the tabs without CDP. See
+`extension/README.md` for the install steps and the bridge security. Without
+the extension, BH uses the CDP way above.
 
-1. **Try fast-path via BH companion Chrome extension** (zero focus steal).
-   If `bh_extension_client.is_available()` → uses
-   `chrome.tabs.create({active:false, windowId:X})` for true silent spawn.
-2. **Detect existing second window** by heuristic: the window with the
-   FEWEST real tabs (main window has user's daily browsing).
-3. **Spawn second window if missing** via `chrome.exe --new-window`.
-   Steals focus once (Windows OS behavior, unavoidable).
-4. **Reuse existing agent tab** if state file records one that's still alive.
-5. **Spawn new agent tab** via `window.open` from a seed tab in the second
-   window. Uses `userGesture=True` to bypass popup blocker. Brief focus
-   flicker (~100-200ms) without extension; zero with extension.
+## Environment
 
-State persists at `~/.browser-harness/second-window-state.json` — survives
-process restart.
-
-## API surface (Kimi WebBridge tool parity)
-
-| Kimi tool | second_window helper |
-|-----------|----------------------|
-| navigate | `navigate_agent` |
-| snapshot | `snapshot_agent` (innerText) or `evaluate_agent` for AX tree |
-| evaluate | `evaluate_agent` |
-| click | `click_at_agent` (alias `mouse_click_agent`) |
-| mouse_click | `click_at_agent` |
-| fill | `fill_agent` |
-| key_type | `key_type_agent` |
-| send_keys | `send_keys_agent` (independent keys, no held modifiers) |
-| (chord) | `hotkey_agent` (real Ctrl/Shift/Alt/Meta shortcuts) |
-| screenshot | `screenshot_agent` |
-| save_as_pdf | `save_as_pdf_agent` |
-| upload | `upload_agent` |
-| list_tabs | `list_agent_tabs` (agent-scoped) |
-| find_tab | `find_agent_tab` |
-| close_tab | `close_agent_tab` |
-| close_session | LRU prune via `prune_agent_tabs` |
-| network | use raw `cdp("Network.enable", ...)` + `drain_events()` |
-
-## Focus-steal mitigation (CDP fallback path)
-
-Without the companion extension, Chrome activates the target window when any
-new tab is created. We mitigate by:
-
-1. Capturing the user's main-window tab id BEFORE spawn
-2. Issuing the `window.open` from second-window seed tab
-3. Calling `Target.activateTarget` on the captured main tab to restore focus
-4. Repeating the activate after the new tab finishes loading
-
-Net effect: a brief flicker rather than persistent theft. For zero flicker,
-install the companion extension at `extension/` (see `extension/README.md`).
-
-## Constraints
-
-- Requires CDP attach (port 9222 chrome instance)
-- `window.open` from agent operations is the only path that doesn't abuse
-  `Target.createTarget` — which respects neither windowId nor focus
-- `seed_tab` must allow `Runtime.evaluate(userGesture=True)`. Banking sites
-  with strict CSP may reject; fallback: companion extension path
-- chrome.exe path autodetected on Windows; override via `BH_CHROME_EXE`
+| Variable | Effect |
+|---|---|
+| `BH_KEEP_PLACEHOLDERS=1` | Keep start-page tabs at exit. |
+| `BH_TAB_MARKER` | Defaults to 0 in this fork, so BH does not put the horse emoji in tab titles. |
+| `BH_EXTENSION_DIR` | Folder of the companion extension. The bridge token file goes there. |
+| `BH_SAFE_MODE` | Never set it to 0. The user's hook blocks that. |
