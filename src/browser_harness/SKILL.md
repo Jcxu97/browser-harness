@@ -1,6 +1,6 @@
 ---
 name: browser-harness
-description: "Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work."
+description: "Control a real browser via CDP: clicking, typing, navigation, logged-in sessions, JS-rendered or bot-protected pages. Not for plain HTTP fetches of public content - use curl for those."
 ---
 
 # browser-harness
@@ -36,13 +36,39 @@ PY
 
 ## Local Chrome
 
+The default daemon can keep many tabs and visit many sites; browser-harness has
+no per-site, screenshot, or result-count limit that requires a new daemon.
+Chrome memory and page complexity are the practical limits. Reuse matching tabs
+with `list_tabs()` and `switch_tab()`.
+
+One daemon has one mutable attached/current tab. Many agents can share it when
+their browser operations are serialized: treat local Chrome as one shared
+browser lane while non-browser work continues in parallel. Sequential tab
+switching, input, and screenshot capture are safe. Do not create another local
+daemon merely because several agents exist.
+
+Two agents that switch tabs and act simultaneously can race, causing one to act
+on or capture the other's tab. For truly simultaneous interactive work, use
+separate remote browsers when Browser Use Cloud authentication is already
+available. Otherwise serialize browser operations through the default local
+daemon. A named local daemon is a last resort when simultaneous isolation is
+required, remote auth is unavailable or unsuitable, and the extra Chrome
+approval prompt is acceptable. It creates another controller and dedicated tab
+in the same local Chrome profile, not another Chrome profile or process.
+
+If the default daemon becomes stale, use its built-in reattachment/recovery
+first. A command timeout, truncated output, site change, closed tab, or new task
+is not a reason to create another daemon. Run `browser-harness --doctor` and
+restart or replace the default daemon only when it is actually dead or cannot
+recover.
+
 If the daemon cannot connect, run diagnostics:
 
 ```bash
 browser-harness --doctor
 ```
 
-If Chrome is not running at all, the harness launches it automatically and retries — no user action needed beyond clicking Allow if a permission popup appears.
+If Chrome is not running at all, the harness launches it automatically and retries.
 
 If Chrome is running but remote debugging is not enabled, the harness opens:
 
@@ -50,11 +76,48 @@ If Chrome is running but remote debugging is not enabled, the harness opens:
 chrome://inspect/#remote-debugging
 ```
 
-Ask the user to tick "Allow remote debugging for this browser instance" and click Allow if Chrome shows a permission popup. Then retry the same `browser-harness` command.
+On macOS, when local Chrome asks for remote-debugging permission, keep the
+original browser command running and call `mac-approve` in another shell/tool
+call. Preserve the exact daemon name: if the waiting command used
+`BU_NAME=r7k2`, run:
+
+```text
+BU_NAME=r7k2 browser-harness mac-approve
+```
+
+For the default daemon, omit the `BU_NAME` prefix. The original command resumes
+when the helper returns `ready`; do not rerun it. If the helper reports
+`accessibility-required`, ask the user once to grant the app launching
+browser-harness (for example Terminal, iTerm, or Codex) access in System
+Settings > Privacy & Security > Accessibility, then call `mac-approve` once
+again. This is only for local Chrome; do not call it for `BU_CDP_URL`,
+`BU_CDP_WS`, or Browser Use Cloud.
+
+When the shell tool can yield a still-running process, use a short 3-5 second
+initial yield for the first local command, not a 30-second wait. If the command
+yields with the Allow hint, leave that exact process running, immediately call
+`browser-harness mac-approve` in a second tool call, then resume or poll the
+original process. With a named daemon, preserve its exact `BU_NAME` for the
+helper. Never start the browser command again. If the user clicks Allow first,
+the same handshake completes and the original command returning successfully
+is the agent's feedback; `mac-approve` also returns `ready` when the daemon is
+already connected.
+
+`mac-approve` is macOS-only. On Linux or Windows, keep the original browser
+command running and ask the user to click Allow if Chrome presents the approval
+dialog. Their click completes the same handshake, so resume or poll the original
+process for success; do not rerun it or create a replacement daemon. If that
+Chrome build presents no approval dialog, the original command simply connects.
 
 ## Remote Browsers
 
 Use Browser Use cloud for headless servers, parallel sub-agents, or isolated work.
+
+Remote browsers require Browser Use Cloud authentication. Check
+`browser-harness auth status` before depending on them. `browser-harness auth
+login` stores authentication for later processes, so an API key does not need to
+be passed to every agent process; without stored authentication or an available
+`BROWSER_USE_API_KEY`, serialize work through the default local daemon instead.
 
 Cloud browsers are managed Chrome instances hosted by Browser Use. Each one is a fresh, isolated browser. Proactively suggest one (briefly explain why) when:
 
@@ -102,8 +165,12 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
+- When entering unusually long text, avoid slow per-character typing: find a faster page-appropriate input method, then verify the page kept the exact value.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
 - Raw CDP is available with `cdp("Domain.method", ...)`.
+  Pass CDP parameters as keywords: `cdp("Input.insertText", text="hello")`.
+  The second positional argument is a session ID, not a parameters dictionary.
+  When targeting an explicit session, use `session_id="..."` alongside the keywords.
 
 ## Recordings and Videos
 
@@ -181,12 +248,19 @@ optional zero-focus-steal Chrome extension companion at `extension/`.
 
 - Coordinate clicks default. CDP mouse events pass through iframes/shadow/cross-origin at the compositor level.
 - Keep the connection model simple: use the default daemon, `BU_NAME`, `BU_CDP_URL`, `BU_CDP_WS`, or `start_remote_daemon(...)`.
+- Trusted orchestrators can set `BH_OPEN_LIVE_URL=0` while provisioning a Cloud
+  daemon to keep its interactive live-view URL from being printed or opened.
+  The URL is still created and returned by `start_remote_daemon()`; callers must
+  avoid logging or serializing that returned field.
+- Trusted orchestrators that already provisioned an exact named daemon can set
+  `BH_REQUIRE_EXISTING_DAEMON=1`. Each CLI call then health-checks and reuses
+  that daemon or fails closed; it never auto-starts or discovers another Chrome.
 - Core helpers stay short. Put task-specific helper additions in `$BH_AGENT_WORKSPACE/agent_helpers.py`.
 
 ## Gotchas
 
 - `chrome://inspect/#remote-debugging` must be enabled for local Chrome control.
-- Chrome may show an "Allow remote debugging?" popup; wait for the user to click Allow. Do not retry in a loop — Chrome pops a fresh dialog for every new connection, and the daemon's single held connection is what makes this a one-time click.
+- On macOS, if local Chrome shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper.
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.

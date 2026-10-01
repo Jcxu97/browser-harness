@@ -11,9 +11,9 @@ import sys
 import uuid
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import paths
-
 
 POSTHOG_KEY = "phc_rCPCLPtaXB3EuBdiH7JLKtU2Wj5iPnuwdsbw58CnjYXc"
 POSTHOG_HOST = "https://eu.i.posthog.com"
@@ -234,6 +234,16 @@ def _base_properties() -> dict:
     }
 
 
+def _cdp_hostname() -> str | None:
+    value = os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")
+    if not value:
+        return None
+    try:
+        return urlparse(value if "://" in value else f"//{value}").hostname
+    except ValueError:
+        return None
+
+
 def capture(event: str, properties: dict | None = None) -> None:
     if not is_enabled():
         return
@@ -281,6 +291,7 @@ def capture_cli_event(
                 "command": command,
                 # 'cloud' | 'cdp' | 'local'
                 "browser": browser,
+                "cdp_url": _cdp_hostname(),
                 "client": os.environ.get("BH_CLIENT") or None,
                 "client_version": os.environ.get("BH_CLIENT_VERSION") or None,
                 "agent_client": _detect_agent_client(),
