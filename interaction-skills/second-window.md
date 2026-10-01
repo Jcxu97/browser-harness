@@ -27,10 +27,18 @@ BH opens the window in this order:
 2. Without it: `Target.createTarget(newWindow=True, background=True, windowState="minimized")`,
    then `Browser.setWindowBounds` with `windowState: "minimized"`.
 
-Agent tabs open with the extension (`chrome.tabs.create({windowId, active: false})`)
-or with `window.open` from the anchor tab. Each new tab has a nonce in its start
-URL (`example.com/?bh-agent-tab=1&bh-nonce=...`), so BH knows which tab it
-opened. When a new tab lands outside the agent window, BH closes it.
+Agent tabs open with the extension (`chrome.tabs.create({windowId, active: false})`).
+Each new tab has a nonce in its start URL (`example.com/?bh-agent-tab=1&bh-nonce=...`),
+so BH knows which tab it opened. When a new tab lands outside the agent window,
+BH closes it.
+
+Without the extension, CDP cannot add a tab to the minimized agent window
+without focus. `window.open` from the anchor tab makes Chrome restore the window
+and bring it to the front. So each new tab opens in a minimized window of its
+own (`Target.createTarget(newWindow=True, background=True, windowState="minimized")`).
+The record of the tab keeps that window id. BH treats the tab as an agent tab
+while it stays in that window, and closes the tab and its window when the
+process exits.
 
 ## Leases
 

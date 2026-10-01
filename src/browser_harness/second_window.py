@@ -47,8 +47,8 @@ DEFAULT_MAX_AGENT_TABS = 15
 LEASE_IDLE_SECONDS = 1800
 PLACEHOLDER_REAP_AGE_SECONDS = 60
 SPAWN_FOCUS_WARNING = (
-    "[bh.second_window] The companion extension is not connected. Using the "
-    "CDP fallback: Chrome can flash once in the taskbar."
+    "[bh.second_window] The companion extension is not connected. The new agent "
+    "tab opens in a minimized window of its own."
 )
 
 
@@ -457,32 +457,56 @@ def _assert_landed_in(tid, expected_wid):
 
 
 def _spawn_agent_tab(wid, use_extension=True):
+    """Open a placeholder agent tab. Returns (tid, nonce, window): window is None
+    for a tab in the agent window, else the window that holds only this tab."""
     nonce = _new_nonce()
     url = f"{AGENT_SPAWN_URL}&bh-nonce={nonce}"
     ext = _extension() if use_extension else None
-    tid = None
-    if ext is not None:
-        r = ext.send_command("create_tab", windowId=wid, url=url, active=False, timeout=10)
-        if not r or "tabId" not in r:
-            raise RuntimeError(f"extension could not create the agent tab: {r}")
-        tid = _resolve_nonce(nonce, 8.0)
-    else:
+    if ext is None:
+        # CDP cannot add a tab to the minimized agent window without focus:
+        # window.open() made Chrome restore and activate it (seen 2026-10-01).
+        # A new minimized window opens without focus.
         print(SPAWN_FOCUS_WARNING, file=sys.stderr)
-        _, anchor = find_agent_window()
-        if anchor is None:
-            raise RuntimeError("the agent window has no anchor tab to open a tab from")
-        sid = _attach(anchor)
-        try:
-            cdp("Runtime.evaluate", session_id=sid, userGesture=True,
-                expression=f"window.open({json.dumps(url)}, '_blank', 'noopener')")
-        finally:
-            _detach(sid)
-        tid = _resolve_nonce(nonce, 8.0)
+        tid = cdp("Target.createTarget", url=url, newWindow=True, background=True,
+                  windowState="minimized")["targetId"]
+        window = _window_of(tid)
+        if window is None:
+            try:
+                cdp("Target.closeTarget", targetId=tid)
+            except Exception:
+                pass
+            raise RuntimeError(f"agent tab {tid}: cannot confirm which window it is in; closed it")
+        _SPAWNED.add(tid)
+        return tid, nonce, window
+    r = ext.send_command("create_tab", windowId=wid, url=url, active=False, timeout=10)
+    if not r or "tabId" not in r:
+        raise RuntimeError(f"extension could not create the agent tab: {r}")
+    tid = _resolve_nonce(nonce, 8.0)
     if tid is None:
         raise RuntimeError("agent tab spawn failed: the new tab did not show up in CDP")
     _assert_landed_in(tid, wid)
     _SPAWNED.add(tid)
-    return tid, nonce
+    return tid, nonce, None
+
+
+def _new_record(tid, nonce, window):
+    rec = {"tid": tid, "nonce": nonce, "created_at": time.time()}
+    if window is not None:
+        rec["window"] = window
+    return rec
+
+
+def _in_agent_window(record, wid):
+    """Is the tab of record in the agent window, or still in the window that the
+    CDP fallback opened for it?"""
+    w = _window_of(record["tid"])
+    return w is not None and w in (wid, record.get("window"))
+
+
+def _own_windows():
+    """Windows that the CDP fallback opened for single tabs, while the tab is in them."""
+    return [r["window"] for r in _load_state().get("agent_tabs", [])
+            if r.get("window") and _window_of(r["tid"]) == r["window"]]
 
 
 # ---------- agent tabs ----------
@@ -505,7 +529,7 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True, pre
         state = _load_state()
         pages = {t["targetId"]: t for t in _page_targets()}
         records = [r for r in state.get("agent_tabs", [])
-                   if r.get("tid") in pages and _window_of(r["tid"]) == wid]
+                   if r.get("tid") in pages and _in_agent_window(r, wid)]
         state["agent_tabs"] = records
         _gc_orphan_claims(state)
         tiers = [
@@ -527,10 +551,10 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True, pre
             _take(chosen, owner)
         _save_state(state)
     if chosen is None:
-        tid, nonce = _spawn_agent_tab(wid, use_extension=prefer_extension)
+        tid, nonce, window = _spawn_agent_tab(wid, use_extension=prefer_extension)
         with _state_mutex():
             state = _load_state()
-            chosen = {"tid": tid, "nonce": nonce, "created_at": time.time()}
+            chosen = _new_record(tid, nonce, window)
             _take(chosen, owner)
             state.setdefault("agent_tabs", []).append(chosen)
             _save_state(state)
@@ -542,10 +566,10 @@ def ensure_agent_tab(max_tabs=DEFAULT_MAX_AGENT_TABS, prefer_extension=True, pre
 def new_agent_tab(url=None):
     """Open one more agent tab leased to this process. Does not bind it."""
     wid = ensure_agent_window()
-    tid, nonce = _spawn_agent_tab(wid)
+    tid, nonce, window = _spawn_agent_tab(wid)
     with _state_mutex():
         state = _load_state()
-        rec = {"tid": tid, "nonce": nonce, "created_at": time.time()}
+        rec = _new_record(tid, nonce, window)
         _take(rec, _get_owner_id())
         state.setdefault("agent_tabs", []).append(rec)
         _save_state(state)
@@ -593,11 +617,15 @@ def prune_agent_tabs(max_n=DEFAULT_MAX_AGENT_TABS):
 
 
 def is_agent_tab(tid):
-    """Is tid a tab in the agent window, other than the anchor?"""
+    """Is tid a tab in the agent window other than the anchor, or a tab in the
+    window that the CDP fallback opened for it?"""
     if not tid:
         return False
     wid, anchor = find_agent_window()
-    return wid is not None and tid != anchor and _window_of(tid) == wid
+    if tid == anchor:
+        return False
+    rec = next((r for r in _load_state().get("agent_tabs", []) if r.get("tid") == tid), {"tid": tid})
+    return _in_agent_window(rec, wid)
 
 
 def is_placeholder(tid):
@@ -757,7 +785,9 @@ def _exit_cleanup():
                     placeholder = bool(r.get("nonce")) and r["nonce"] in url
                     unused = (r["tid"] in _SPAWNED and r["tid"] not in _NAVIGATED
                               and url in ("", "about:blank"))
-                    if not keep and r["tid"] in pages and (placeholder or unused):
+                    # A CDP fallback tab has a window of its own; close it so
+                    # these windows do not pile up in the taskbar.
+                    if r["tid"] in pages and (r.get("window") or (not keep and (placeholder or unused))):
                         to_close.append(r["tid"])
                         continue
                 kept.append(r)
@@ -816,10 +846,15 @@ def _filter_targets(response):
     if not isinstance(infos, list):
         return response
     wid, anchor = find_agent_window(pages=[t for t in infos if t.get("type") == "page"])
-    keep = [t for t in infos if t.get("type") != "page"
-            or (wid is not None and t.get("targetId") != anchor
-                and _window_of_cached(t.get("targetId")) == wid)]
-    return {**response, "result": {**res, "targetInfos": keep}}
+    own = {r.get("tid"): r.get("window") for r in _load_state().get("agent_tabs", [])}
+
+    def visible(t):
+        tid = t.get("targetId")
+        if t.get("type") != "page":
+            return True
+        w = _window_of_cached(tid)
+        return tid != anchor and w is not None and w in (wid, own.get(tid))
+    return {**response, "result": {**res, "targetInfos": [t for t in infos if visible(t)]}}
 
 
 def request_policy(req, forward):
@@ -1342,10 +1377,13 @@ def close_agent_tabs_matching(url_substring, keep=None):
 # ---------- showing the window for a login ----------
 
 def show_window(tid=None):
-    """Bring the agent window to the front so the user can type a password.
-    Call hide_window() when the user says they are done."""
+    """Bring the window that holds tid to the front so the user can type a
+    password. Call hide_window() when the user says they are done."""
     wid = ensure_agent_window()
     tid = tid or _BOUND["tid"]
+    rec = next((r for r in _load_state().get("agent_tabs", []) if r.get("tid") == tid), None)
+    if rec and rec.get("window") and _window_of(tid) == rec["window"]:
+        wid = rec["window"]
     ext = _extension(wait=2.0)
     if ext is not None:
         ext.send_command("update_window", windowId=wid, state="normal", focused=True, timeout=5)
@@ -1357,12 +1395,15 @@ def show_window(tid=None):
 
 
 def hide_window():
+    """Minimize the agent window and the windows of CDP fallback tabs."""
     wid, _ = find_agent_window()
-    if wid is None:
+    windows = ([wid] if wid is not None else []) + _own_windows()
+    if not windows:
         return None
     ext = _extension(wait=2.0)
-    if ext is not None:
-        ext.send_command("update_window", windowId=wid, state="minimized", timeout=5)
-    else:
-        cdp("Browser.setWindowBounds", windowId=wid, bounds={"windowState": "minimized"})
+    for w in windows:
+        if ext is not None:
+            ext.send_command("update_window", windowId=w, state="minimized", timeout=5)
+        else:
+            cdp("Browser.setWindowBounds", windowId=w, bounds={"windowState": "minimized"})
     return wid

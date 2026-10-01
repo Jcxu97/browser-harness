@@ -27,6 +27,7 @@ class FakeBrowser:
         self.sessions = {}
         self.closed, self.clicks, self.bounds, self.activated = [], [], [], []
         self.keys = []
+        self.created, self.window_opens = [], []
         self.ext_calls = []
         self.ax_nodes = []
         self._ids = itertools.count(1)
@@ -87,6 +88,7 @@ class FakeBrowser:
             self.sessions.pop(p.get("sessionId"), None)
             return {}
         if method == "Target.createTarget":
+            self.created.append(p)
             wid = self.add_window([p["url"]]) if p.get("newWindow") else USER_WID
             if wid == USER_WID:
                 self.add_tab(USER_WID, p["url"])
@@ -103,6 +105,7 @@ class FakeBrowser:
             expr = p["expression"]
             if expr.startswith("window.open("):
                 url = expr.split('"')[1]
+                self.window_opens.append(url)
                 self.add_tab(self.window_of(tid), url)
                 return {"result": {}}
             if expr == "performance.timeOrigin":
@@ -216,6 +219,44 @@ def test_new_tab_opens_in_the_agent_window_without_activation(chrome):
     assert chrome.window_of(tid) == wid
     action, params = chrome.ext_calls[-1]
     assert action == "create_tab" and params["windowId"] == wid and params["active"] is False
+
+
+def test_cdp_fallback_tab_gets_a_minimized_window_of_its_own(chrome):
+    """In real Chrome, window.open() restores and activates the minimized agent
+    window (seen 2026-10-01). Without the extension, use a new minimized window."""
+    wid = sw.ensure_agent_window()
+    chrome.ext = None
+    tid = sw.ensure_agent_tab()
+    own = chrome.window_of(tid)
+    assert own not in (USER_WID, wid) and not chrome.window_opens
+    assert chrome.created[-1] == {"url": chrome.pages[tid]["url"], "newWindow": True,
+                                  "background": True, "windowState": "minimized"}
+    assert sw.is_agent_tab(tid) and sw.ensure_agent_tab() == tid
+    infos = _policy(chrome, "Target.getTargets")["result"]["targetInfos"]
+    assert [t["targetId"] for t in infos] == [tid]
+    assert len(chrome.windows[USER_WID]) == 2
+
+
+def test_cdp_fallback_window_closes_when_the_process_exits(chrome):
+    sw.ensure_agent_window()
+    chrome.ext = None
+    tid = sw.new_agent_tab("https://site.example/page")
+    sw._exit_cleanup()
+    assert tid in chrome.closed
+    assert not [r for r in _state()["agent_tabs"] if r["tid"] == tid]
+
+
+def test_show_and_hide_act_on_the_window_that_holds_the_tab(chrome):
+    wid = sw.ensure_agent_window()
+    chrome.ext = None
+    tid = sw.ensure_agent_tab()
+    own = chrome.window_of(tid)
+    sw.show_window(tid)
+    assert chrome.bounds[-1] == (own, {"windowState": "normal"}) and chrome.activated == [tid]
+    n = len(chrome.bounds)
+    sw.hide_window()
+    hidden = chrome.bounds[n:]
+    assert (wid, {"windowState": "minimized"}) in hidden and (own, {"windowState": "minimized"}) in hidden
 
 
 def test_parallel_process_does_not_get_a_busy_tab(chrome):
