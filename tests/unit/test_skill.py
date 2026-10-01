@@ -1,5 +1,7 @@
 from importlib import resources
 
+from browser_harness import run
+
 
 def _frontmatter(text: str) -> str:
     assert text.startswith("---\n")
@@ -9,7 +11,7 @@ def _frontmatter(text: str) -> str:
 
 
 def test_packaged_skill_frontmatter_is_valid_simple_yaml():
-    text = resources.files("browser_harness").joinpath("SKILL.md").read_text()
+    text = run._skill_text()
     metadata = {}
 
     for line in _frontmatter(text).splitlines():
@@ -33,3 +35,13 @@ def test_packaged_skill_frontmatter_is_valid_simple_yaml():
         "name": "browser-harness",
         "description": "Control a real browser via CDP: clicking, typing, navigation, logged-in sessions, JS-rendered or bot-protected pages. Not for plain HTTP fetches of public content - use curl for those.",
     }
+
+
+def test_skill_text_follows_a_symlink_checked_out_as_a_text_file(tmp_path, monkeypatch):
+    (tmp_path / "SKILL.md").write_text("---\nname: browser-harness\n---\n", encoding="utf-8")
+    package = tmp_path / "src" / "browser_harness"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text("../../SKILL.md", encoding="utf-8")
+    monkeypatch.setattr(resources, "files", lambda name: package)
+
+    assert run._skill_text() == "---\nname: browser-harness\n---\n"

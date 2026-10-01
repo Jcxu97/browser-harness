@@ -108,10 +108,23 @@ def _cloud_auth_configured():
         return False
 
 
-def _print_skill():
+def _skill_text():
     from importlib import resources
+    skill = resources.files("browser_harness").joinpath("SKILL.md")
     # SKILL.md is UTF-8 (contains emoji); locale-codec read crashes on gbk Windows
-    print(resources.files("browser_harness").joinpath("SKILL.md").read_text(encoding="utf-8"), end="")
+    text = skill.read_text(encoding="utf-8")
+    # In a git checkout SKILL.md is a symlink to the repo root copy. Without
+    # symlink support (the Git for Windows default) git writes a text file that
+    # holds only the target path, so follow it.
+    target = text.strip()
+    if "\n" not in target and target.endswith("SKILL.md"):
+        with open(os.path.join(os.path.dirname(str(skill)), target), encoding="utf-8") as f:
+            text = f.read()
+    return text
+
+
+def _print_skill():
+    print(_skill_text(), end="")
 
 
 def _telemetry_command(args):
