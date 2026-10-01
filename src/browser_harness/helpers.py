@@ -15,9 +15,8 @@ CORE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CORE_DIR.parent.parent
 # Upstream v0.1.8 moved this to ~/.config/browser-harness/agent-workspace.
 # This fork keeps the in-repo directory when it exists: agent_helpers.py and
-# domain-skills/ live there, are version-controlled, and several image_gen
-# drivers resolve assets relative to it. Silently switching to an empty dir in
-# $HOME would drop every custom helper with no error. BH_AGENT_WORKSPACE still
+# domain-skills/ live there and are version-controlled. Silently switching to
+# an empty dir in $HOME would drop every custom helper with no error. BH_AGENT_WORKSPACE still
 # wins (it's how upstream's own tests relocate the dir).
 _repo_workspace = REPO_ROOT / "agent-workspace"
 AGENT_WORKSPACE = (

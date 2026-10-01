@@ -560,8 +560,7 @@ def test_send_keys_takes_a_named_key_as_one_key(chrome):
     assert [k for k in chrome.keys if k[0] == "keyDown"] == [("keyDown", "a"), ("keyDown", "b")]
 
 
-@pytest.mark.parametrize("first", ["browser_harness.second_window", "browser_harness.helpers",
-                                   "browser_harness.image_gen"])
+@pytest.mark.parametrize("first", ["browser_harness.second_window", "browser_harness.helpers"])
 def test_safe_mode_installs_whatever_module_loads_first(first):
     """Under pytest the policy is not installed, so run a real interpreter.
     second_window imports helpers, and helpers installs a policy from

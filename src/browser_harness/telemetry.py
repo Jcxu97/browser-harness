@@ -111,9 +111,8 @@ def is_enabled() -> bool:
     # raw. So fill("#password", ...) arguments and every URL we visit would leave
     # the machine verbatim.
     #
-    # This fork drives the user's REAL logged-in Chrome (second_window.py) and
-    # automates Doubao / M365 Copilot with prompt text in the scripts, so that
-    # payload is not acceptable. Gating here rather than deleting the module
+    # This fork drives the user's REAL logged-in Chrome (second_window.py), so
+    # that payload is not acceptable. Gating here rather than deleting the module
     # keeps future upstream merges reviewable: every capture_* path already
     # checks is_enabled() first, so this single return disables all of them.
     # Flip to the upstream body only after re-auditing capture_cli_event().

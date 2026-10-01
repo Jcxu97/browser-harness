@@ -304,33 +304,5 @@ If you learn anything non-obvious (a private API, stable selector, framework qui
 
 ## Image generation
 
-The drivers run in agent tabs and use the user's signed-in sessions. Pick the
-channel by the user's rule:
-
-1. Try M365 Copilot first. It is free and makes one 1024×1024 image.
-2. When Copilot fails, ask the user: Doubao (free, 4 images, 2 to 3 minutes)
-   or GPT image-2 (paid, 1 image, about 70 seconds).
-3. When the user names a channel, use it and do not ask.
-
-```python
-from browser_harness.image_gen import copilot_generate, copilot_pick
-from browser_harness.image_gen import doubao_generate, doubao_pick
-from browser_harness.image_gen import gpt_image_generate, gpt_image_pick
-
-session = copilot_generate("a ginkgo leaf, watercolor", "<project>/assets/leaf")
-session = doubao_generate("极简插画风格，一只橘猫坐在窗台上", "<project>/assets/cat")
-doubao_pick(session, idx=2, dst_path="<project>/assets/cat.png")  # keeps one, deletes the rest
-```
-
-Each call returns a dict. `session["fulls"]` holds the PNG paths. Look at them
-with Read before you pick one.
-
-Doubao serves two CDN copies of each image. `image_pre_watermark` has the mark
-at the top left, and `image_dld_watermark` has it at the bottom right. The
-driver merges the clean halves, so the result has no watermark and no
-inpainting. Credit: github.com/Qalxry/doubao-no-watermark.
-
-GPT image-2 does not use the browser. It calls the sub2api OpenAI-compatible
-`/v1/images/generations` endpoint and needs `SUB2API_BASE` and `SUB2API_KEY`.
-Cloudflare in front of sub2api refuses requests without a browser User-Agent.
-The module sends one. Test script and notes: `experiments/sub2api-gpt-image2/`.
+This fork does not make images in the browser. Use the `image-2-5` skill
+(gpt-image-2.5 API) for all image generation and image edits.
