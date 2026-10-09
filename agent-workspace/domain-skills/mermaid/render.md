@@ -48,7 +48,7 @@ while time.monotonic() < deadline:
       return {
         rendered: graphs.length > 0,
         editorCode: editor ? [...editor.querySelectorAll('.cm-line')].map(el => el.textContent).join('\\n') : null,
-        syntaxErr: /syntax error|parse error/i.test(document.body.innerText || '')
+        syntaxErr: graphs.some(graph => graph.querySelector('.error-icon, .error-text'))
       };
     })()""")
     if state["syntaxErr"]:
