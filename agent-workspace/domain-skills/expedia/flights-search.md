@@ -28,12 +28,7 @@ Expedia flight search can be initiated via a **direct URL** — this is the
 airport autocomplete, and traveller widget entirely:
 
 ```
-https://www.expedia.ca/Flights-Search?
-  flight-type=roundtrip&mode=search&trip=roundtrip&
-  leg1=from:YYZ,to:ICN,departure:2026/07/03TANYT&
-  leg2=from:ICN,to:YYZ,departure:2026/07/25TANYT&
-  passengers=adults:1&options=cabin:economy&
-  sort=price%3Aa
+https://www.expedia.ca/Flights-Search?flight-type=roundtrip&mode=search&trip=roundtrip&leg1=from:YYZ,to:ICN,departure:2027/07/03TANYT&leg2=from:ICN,to:YYZ,departure:2027/07/25TANYT&passengers=adults:1&options=cabin:economy&sort=price%3Aa
 ```
 
 URL parameters:
@@ -50,15 +45,17 @@ Use the `goto_url()` + `new_tab()` fallback pattern — the pre-filled URL
 already loads results directly, no Search button click needed:
 
 ```python
+search_url = "https://www.expedia.ca/Flights-Search?flight-type=roundtrip&mode=search&trip=roundtrip&leg1=from:YYZ,to:ICN,departure:2027/07/03TANYT&leg2=from:ICN,to:YYZ,departure:2027/07/25TANYT&passengers=adults:1&options=cabin:economy&sort=price%3Aa"
 try:
-    goto_url("https://www.expedia.ca/Flights-Search?...")
+    goto_url(search_url)
     wait_for_load(timeout=25)
-    has_results = js('!!document.querySelector("[data-stid*=listing]")')
-    if not has_results:
-        raise Exception("no results loaded")
-except:
-    new_tab("https://www.expedia.ca/Flights-Search?...")
+    if not js('!!document.querySelector("[data-stid*=listing]")'):
+        raise RuntimeError("No flight listings appeared")
+except Exception:
+    new_tab(search_url)
     wait_for_load(timeout=25)
+    if not js('!!document.querySelector("[data-stid*=listing]")'):
+        raise RuntimeError("Flight listings are still absent; inspect the page")
 ```
 
 **CRITICAL: Do NOT click the Search button.** The pre-filled URL already
@@ -169,28 +166,13 @@ Using browser-harness `js()` with the URL-preload approach (up to 200
 listings):
 
 ```python
-result = []
-for i in range(200):
-    try:
-        text = js('(document.querySelectorAll("[data-stid*=\\"listing\\"]")[%d]||{}).innerText' % i)
-        if text:
-            result.append(text[:500])
-    except:
-        pass
+result = js("""Array.from(document.querySelectorAll('[data-stid*="listing"]'))
+    .slice(0, 200).map(card => card.innerText).filter(Boolean)""")
+if not result:
+    raise RuntimeError("No flight cards appeared; inspect the page before reporting results")
 ```
 
-Using browser-harness `js()` with a single expression:
-
-```python
-listings = js("""
-(function() {
-    var cards = document.querySelectorAll('[data-stid*="listing"]');
-    return JSON.stringify(Array.from(cards).slice(0, 30).map(function(c) {
-        return c.innerText.substring(0, 500);
-    }).filter(function(t) { return t.length > 50; }));
-})()
-""")
-```
+This example captures at most 200 rendered cards. Verify additional pages or lazy loading before claiming complete results.
 
 Using Playwright for structured extraction (form-submit result page):
 
@@ -314,8 +296,7 @@ To get the REAL total price (not the listing estimate):
    across repeated searches from the same IP, as bot score accumulates.
 
 9. **Use non-headless mode** with xvfb on headless servers — headless
-   mode is heavily fingerprintable. The `--disable-blink-features=
-   AutomationControlled` flag + `navigator.webdriver` override is
+   mode is heavily fingerprintable. The `--disable-blink-features=AutomationControlled` flag + `navigator.webdriver` override is
    essential.
 
 10. **Wait for async loads** — after search or filter application, wait
