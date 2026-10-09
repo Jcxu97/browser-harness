@@ -1,5 +1,7 @@
 # jetblue / checkout
 
+Stop before booking or payment submission unless the user authorizes that specific purchase.
+
 End-to-end JetBlue (jetblue.com) one-way cash checkout: search -> flight -> cart -> traveler details -> seats/extras -> payment. Verified reachable to payment-entry with test data in ~9 minutes.
 
 ## Site map
@@ -89,22 +91,23 @@ These are **out-of-process iframes (OOPIF)**. Compositor-level coordinate clicks
 
 What works: **attach to each OOPIF's CDP target and dispatch key events against the iframe's own session.**
 
+Use `card_number` from the authorized task input. Never log its value.
+Repeat the same attach, type, and detach sequence for `cvv_id`.
+
 ```python
-# 1) Find the tokenex iframe targets
 targets = cdp("Target.getTargets")
 pan_id  = next(t['targetId'] for t in targets['targetInfos'] if 'tokenex' in t.get('url','') and 'Mode=Data' in t['url'])
 cvv_id  = next(t['targetId'] for t in targets['targetInfos'] if 'tokenex' in t.get('url','') and 'Mode=CVV'  in t['url'])
 
-# 2) Attach (flatten=True is required so we can pass session_id on each call)
+# The payment frame needs its own session for keyboard events.
 pan_session = cdp("Target.attachToTarget", targetId=pan_id, flatten=True)['sessionId']
-cvv_session = cdp("Target.attachToTarget", targetId=cvv_id, flatten=True)['sessionId']
-
-# 3) Focus the actual input INSIDE the iframe, then dispatch key events against that session.
-#    Both iframes expose input id="data" (PAN: name=cardNumber, CVV: name=Data).
-cdp("Runtime.evaluate", expression='document.getElementById("data").focus();', session_id=pan_session)
-for ch in "4111111111111111":
-    cdp("Input.dispatchKeyEvent", type="keyDown", text=ch, key=ch, code=f"Digit{ch}", session_id=pan_session)
-    cdp("Input.dispatchKeyEvent", type="keyUp",   key=ch, code=f"Digit{ch}", session_id=pan_session)
+try:
+    cdp("Runtime.evaluate", expression='document.getElementById("data").focus();', session_id=pan_session)
+    for ch in card_number:
+        cdp("Input.dispatchKeyEvent", type="keyDown", text=ch, key=ch, code=f"Digit{ch}", session_id=pan_session)
+        cdp("Input.dispatchKeyEvent", type="keyUp", key=ch, code=f"Digit{ch}", session_id=pan_session)
+finally:
+    cdp("Target.detachFromTarget", sessionId=pan_session)
 ```
 
 This is the general pattern for any TokenEx-hosted PCI field (Delta, United, and other airlines/hotels also use TokenEx). Direct `.value =` inside the iframe won't trigger TokenEx's internal validation; key events do.
