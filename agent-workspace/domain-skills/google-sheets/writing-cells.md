@@ -19,16 +19,13 @@ run reported clean.
 
 ```python
 type_text(value)
-press("Delete")      # discards any pending autocomplete suggestion
-press("Tab")
+press_key("Delete")
+press_key("Tab")
 ```
 
-`Delete` removes the selected suggestion. When there is no suggestion it is a **no-op** — the caret
-sits at the end of the typed text with nothing after it — so it is safe to apply unconditionally
-rather than trying to detect when autocomplete fired.
+`Delete` removes the selected autocomplete suffix. Without a suggestion, forward Delete does nothing when the caret follows the entered text. Use this sequence only while editing the cell at that position. Do not send Delete after committing the cell: it can clear the selected cell.
 
-Only text triggers this. Numbers, URLs, and dates are unaffected, but applying `Delete` everywhere
-costs nothing and means you don't have to reason about which columns are at risk.
+The observed failure involved text entries. Verify every written value, including numbers, dates, and URLs.
 
 ## Always read the sheet back
 
@@ -49,12 +46,11 @@ Clicking a grid cell by coordinate is fragile (scroll position, frozen rows, zoo
 stable:
 
 ```python
-click("#t-name-box")
-fill("#t-name-box", "A2")
-press("Enter")
+fill_input("#t-name-box", "A2")
+press_key("Enter")
 ```
 
-Then type across the row with `Tab` between cells and `Enter` to end the row.
+Use `press_key("Delete")` before each `Tab` or `Enter` commit after typing a text value. This removes any selected autocomplete suffix. Verify the resulting cells through the export.
 
 ## Auth note: Google session cookies rotate fast
 
