@@ -122,7 +122,7 @@ page.evaluate("""() => {
     ret.dispatchEvent(new Event('change', { bubbles: true }));
   }
   return true;
-}()")
+}""")
 ```
 
 ### Step 5: Travellers & Cabin
@@ -144,7 +144,7 @@ Search button locators:
 After clicking, wait for results:
 ```python
 page.wait_for_url("**/Flights-Search**", timeout=15000)
-page.wait_for_selector('div[data-stid*="listing"]', timeout=30000)
+page.wait_for_selector('div[data-testid="listing"], div[role="listitem"]', timeout=30000)
 ```
 
 ---
@@ -212,7 +212,7 @@ results = page.evaluate("""() => {
       arrTime: times[1]?.innerText?.trim(),
     };
   }).filter(c => c.price);
-}()")
+}""")
 ```
 
 ### Sorting
