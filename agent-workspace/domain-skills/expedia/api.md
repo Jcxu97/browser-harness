@@ -40,7 +40,7 @@ URLs for a human to open, never fetch the property page at all; if you must
 read one, do it through the user's real browser session (coordinate clicks),
 not `http_get`.
 
-## Affiliate shortlink chain (`expedia.tpx.lv` / `expedia.tp.st`)
+## Affiliate shortlink chain (`expedia.tpx.lv`)
 
 `expedia.tpx.lv/<code>` links are **Travelpayouts** partner shortlinks. The
 redirect chain (observed):
