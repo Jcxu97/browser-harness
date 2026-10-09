@@ -1,9 +1,10 @@
 # Read a Loom recording: narration and timestamped visuals
 
 Use the shared recording URL (`https://www.loom.com/share/<video-id>`) in the
-signed-in browser. Open a new tab and retain its target ID. Explicitly select
-that target before each batch: another browser session can change the harness's
-active tab between calls. Respect the recording's access controls.
+signed-in browser. Reuse a tab with the same recording URL and retain its target ID.
+Open one task tab only when no matching recording tab exists.
+Select that target before each batch because other sessions can change the active tab.
+Respect the recording's access controls.
 
 ## Transcript
 
@@ -19,7 +20,8 @@ The player exposes its seek-preview image as `img[alt="thumb"]`. Inspect its
 `--seekPreviewH` for the tile dimensions. The image is a sprite, not one frame.
 
 The timestamp map is WebVTT. From the recording's own tab, a read-only GraphQL
-request to `/graphql` can retrieve its signed URL:
+request to `/graphql` can retrieve its signed URL.
+Run this example inside an async function when using `js()`:
 
 ```js
 const videoId = location.pathname.split('/').filter(Boolean).at(-1);
@@ -57,15 +59,26 @@ intervals. In one verified recording the sprite was 8 columns by 25 rows of
 
 Loom can have multiple `<video>` elements, including a short preview. Inspect
 `duration`, `videoWidth`, and `videoHeight` to select the actual recording. Pause
-it, attach a `seeked` listener, set `currentTime`, and wait before extracting:
+it before extracting a frame. Set `recordingElement` to that element and `targetSeconds` to the requested time.
+Run the example inside an async function when using `js()`:
 
 ```js
-const video = /* the actual recording element found above */;
+const video = recordingElement;
 video.pause();
-await new Promise(resolve => {
-  video.addEventListener('seeked', resolve, { once: true });
-  video.currentTime = targetSeconds;
-});
+if (Math.abs(video.currentTime - targetSeconds) > 0.01) {
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      video.removeEventListener('seeked', onSeeked);
+      reject(new Error('Video seek timed out'));
+    }, 10000);
+    function onSeeked() {
+      clearTimeout(timeout);
+      resolve();
+    }
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.currentTime = targetSeconds;
+  });
+}
 const canvas = document.createElement('canvas');
 canvas.width = video.videoWidth;
 canvas.height = video.videoHeight;
