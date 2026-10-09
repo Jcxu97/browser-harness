@@ -27,13 +27,7 @@ FlightHub search can be initiated via a **direct URL** — this avoids the
 fragile datepicker and airport autocomplete:
 
 ```
-https://www.flighthub.com/flight/search?
-  seg0_from={ORIGIN}&seg0_to={DEST}&
-  seg1_to={ORIGIN}&seg1_from={DEST}&
-  seg0_date={YYYY-MM-DD}&seg1_date={YYYY-MM-DD}&
-  order_by=cheapest&currency=cad&
-  num_adults=1&num_children=0&num_infants=0&num_infants_lap=0&
-  type=roundtrip&seat_class=Economy
+https://www.flighthub.com/flight/search?seg0_from={ORIGIN}&seg0_to={DEST}&seg1_to={ORIGIN}&seg1_from={DEST}&seg0_date={YYYY-MM-DD}&seg1_date={YYYY-MM-DD}&order_by=cheapest&currency=cad&num_adults=1&num_children=0&num_infants=0&num_infants_lap=0&type=roundtrip&seat_class=Economy
 ```
 
 | Parameter | Description |
@@ -47,17 +41,16 @@ https://www.flighthub.com/flight/search?
 | `order_by` | Sort: cheapest, fastest, best |
 | `currency` | Currency: usd, cad |
 | `num_adults` | Adult passengers |
+| `num_children` | Child passengers |
+| `num_infants` | Infants with seats |
+| `num_infants_lap` | Infants on laps |
+| `type` | `roundtrip` for the two-leg search shown here |
 | `seat_class` | Economy, Premium, Business, First |
 
 ### Example
 
 ```
-https://www.flighthub.com/flight/search?
-  seg0_from=YYZ&seg0_to=ICN&
-  seg1_to=YYZ&seg1_from=ICN&
-  seg0_date=2026-07-03&seg1_date=2026-07-25&
-  order_by=cheapest&currency=cad&
-  num_adults=1&seat_class=Economy
+https://www.flighthub.com/flight/search?seg0_from=YYZ&seg0_to=ICN&seg1_to=YYZ&seg1_from=ICN&seg0_date=2027-07-03&seg1_date=2027-07-25&order_by=cheapest&currency=cad&num_adults=1&num_children=0&num_infants=0&num_infants_lap=0&type=roundtrip&seat_class=Economy
 ```
 
 ---
@@ -109,10 +102,9 @@ Selector: `.home-search-form-submit.search-form-submit.flights.fh`
 This is a `<div>`, not a `<button>`. Click it with `click_at_xy()`:
 
 ```python
-rect = js("JSON.stringify(document.querySelector('.home-search-form-submit').getBoundingClientRect())")
+rect = js("document.querySelector('.home-search-form-submit')?.getBoundingClientRect().toJSON() ?? null")
 if rect:
-    r = json.loads(rect)
-    click_at_xy(r["x"] + r["width"] / 2, r["y"] + r["height"] / 2)
+    click_at_xy(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
 ```
 
 ---
