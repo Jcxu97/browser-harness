@@ -3,6 +3,13 @@
 Fetching files behind a Slack workspace login, given a permalink like
 `https://<ws>.slack.com/files/<USERID>/<FILEID>/<name>`.
 
+Current discovery uses the first hostname label, which can be the workspace name or `app`.
+Read this file directly for Slack file tasks when automatic discovery does not list it.
+
+Only download files that the user requests and their session can access.
+Keep cookies and tokens in memory. Never print them or put them in command arguments, files, or logs.
+Send credentials only to the verified Slack workspace and Slack file hosts.
+
 ## URL structure
 
 - The `FILEID` segment routes; the filename segment is cosmetic. Two permalinks that
@@ -25,7 +32,7 @@ Fetching files behind a Slack workspace login, given a permalink like
    d = next(c["value"] for c in r["cookies"] if c["name"] == "d")
    ```
 
-2. Fetching the permalink HTML with that cookie (plain `http_get`/curl, no browser needed)
+2. Fetching the permalink HTML with that cookie (an in-process HTTP request, no browser needed)
    yields a page embedding `"api_token":"xoxc-…"` and `team_id = "T…"`. No need to load
    `app.slack.com` or dig through localStorage (`localConfig_v2` only exists on the
    `app.slack.com` origin anyway).
