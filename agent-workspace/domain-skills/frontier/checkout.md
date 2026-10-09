@@ -1,5 +1,7 @@
 # Frontier Airlines — flyfrontier.com checkout
 
+Stop before booking or payment submission unless the user authorizes that specific purchase.
+
 Working path **home → Select → Passengers → Bundles → SeatMap → Bags → Extras → Payment/New**. The only real search entry is the homepage widget; direct `booking.flyfrontier.com/Flight/InternetBookingEngine?...` deep links return 404.
 
 ## URLs (in order)
