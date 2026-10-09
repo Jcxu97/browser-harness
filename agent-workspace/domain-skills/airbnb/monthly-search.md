@@ -15,7 +15,7 @@ https://www.airbnb.com/s/San-Francisco--CA--United-States/homes
   already includes fees; `price_max` is applied to that monthly total, not per night.
 - `ne_*/sw_*` + `search_by_map=true` pins the search to the box; the results header reads
   "N homes within map area".
-- Cards: `a[href*="/rooms/<id>"]`; the card text carries "Guest favorite", "Superhost",
+- Cards: `a[href*="/rooms/"]`; the card text carries "Guest favorite", "Superhost",
   "New place to stay" (the newly-listed badge), beds/baths, and the struck/discounted price.
 - When the exact dates return few homes, Airbnb appends flexible-date suggestions; their
   cards start with a date range ("Oct 17 to Dec 16") — treat those as *not available* for
@@ -23,11 +23,18 @@ https://www.airbnb.com/s/San-Francisco--CA--United-States/homes
 
 ## Pagination
 
-18 cards per page. The "Next" button click was flaky under CDP. Use the cursor param instead:
+The observed page contained 18 cards. The "Next" button click failed intermittently.
+Use the cursor parameter with the original `search_url`, which contains filters but no pagination parameters.
+Increase `page_number` for each page and check for repeated listing IDs:
 
 ```python
-cur = base64.b64encode(json.dumps({"section_offset":0,"items_offset":18,"version":1}).encode()).decode()
-url += "&cursor=" + cur + "&items_offset=18"    # 36, 54, ... for later pages
+import base64, json
+from urllib.parse import urlencode
+
+page_number = 2
+offset = (page_number - 1) * 18
+cur = base64.b64encode(json.dumps({"section_offset": 0, "items_offset": offset, "version": 1}).encode()).decode()
+page_url = search_url + "&" + urlencode({"cursor": cur, "items_offset": offset})
 ```
 
 ## Listing page

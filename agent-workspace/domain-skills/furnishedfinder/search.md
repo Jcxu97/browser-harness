@@ -20,17 +20,21 @@ in-page `fetch()` (CORS/auth). Read the payload instead.
 
 ## Getting structured listings (no API key needed)
 
-Each results page embeds every card as a `SearchResultItem` JSON object. Pull them:
+The observed payload stores each card as a `SearchResultItem` JSON object.
+This parser depends on the observed field order. Investigate any parse failure or empty result:
 
 ```python
+import json, re
+
 raw = js("""Array.from(document.querySelectorAll('script'))
   .filter(s=>/self\\.__next_f\\.push/.test(s.textContent)).map(s=>s.textContent).join('\\n')""")
 u = raw.replace('\\"', '"')
 items = []
 for m in re.finditer(r'\{"propertyType":"[^"]*","propertyTypeClass"[\s\S]*?"__typename":"SearchResultItem"\}', u):
-    try: items.append(json.loads(m.group(0)))
-    except ValueError: pass
-# each listing appears twice in the payload → dedupe on listingId
+    items.append(json.loads(m.group(0)))
+if not items:
+    raise RuntimeError("No listing records matched; inspect the payload before reporting an empty search")
+items = list({item["listingId"]: item for item in items}.values())
 ```
 
 Fields per item: `listingId name propertyType propertyTypeClass (entire_unit|room)
@@ -49,8 +53,11 @@ response has `pageInfo{totalResults hasNextPage ...}` plus `listings[]`.
 The payload only ever contains **page 1 (72 items)**. `page={"currentPage":2}` in the URL
 still renders page 1 server-side; the client fetches page 2 through Apollo (which holds its
 own `fetch` reference, so patching `window.fetch` sees nothing). Easiest reliable approach:
-split the map viewport into sub-boxes until each has `totalResults <= 72`, load each box's
-URL, parse, and dedupe. ~160 listings in a 3 km box needed 4 boxes.
+Read `pageInfo.totalResults` for the current viewport before splitting it into smaller boxes.
+The extraction snippet above does not return that count. Stop if you cannot verify it.
+Split until each box has `totalResults <= 72`, then load each URL and remove duplicate listing IDs.
+Verify that each box returns its expected count before reporting a complete result.
+The contributor needed four boxes for approximately 160 listings within a 3 km box.
 
 ## Property page
 
