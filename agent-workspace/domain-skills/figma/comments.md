@@ -17,20 +17,20 @@ wherever you already are:
 
 ```python
 r = js("""
-const xhr = new XMLHttpRequest();
-xhr.open("GET", "/api/file/<FILE_KEY>/comments", false);
-xhr.send();
-const d = JSON.parse(xhr.responseText);
-const byId = {}; d.meta.forEach(c => byId[c.id] = c);
-return JSON.stringify(d.meta
-  .filter(c => !c.is_deleted)
-  .sort((a,b) => b.created_at.localeCompare(a.created_at))
-  .slice(0, 15)
-  .map(c => ({
-    at: c.created_at, who: c.user.handle, msg: c.message,
-    reply_to: c.parent_id ? (byId[c.parent_id]?.message ?? null) : null,
-    resolved: !!c.resolved_at
-  })), null, 1)
+(async () => {
+  const response = await fetch("/api/file/<FILE_KEY>/comments");
+  if (!response.ok) throw new Error("Comments request failed: " + response.status);
+  const data = await response.json();
+  if (!Array.isArray(data.meta)) throw new Error("Comments response has no list");
+  const byId = Object.fromEntries(data.meta.map(c => [c.id, c]));
+  return data.meta.filter(c => !c.is_deleted)
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+    .map(c => ({
+      at: c.created_at, who: c.user?.handle ?? null, msg: c.message,
+      reply_to: c.parent_id ? (byId[c.parent_id]?.message ?? null) : null,
+      resolved: !!c.resolved_at
+    }));
+})()
 """)
 ```
 
@@ -58,7 +58,4 @@ included). Useful fields per comment:
   comments XHR works right there without ever loading the heavy editor.
 - `/api/comments?file_key=<key>` does **not** exist (404). The file-scoped path
   above is the real one.
-- Don't wrap your expression in your own IIFE with an inner `return` — the
-  `js()` helper wraps anything containing `return ` in its own function, and a
-  self-wrapped IIFE gets double-wrapped into an expression whose outer wrapper
-  returns nothing. Write a bare top-level `return` and let the helper do it.
+- The current `js()` helper awaits returned promises and accepts an async function expression.
