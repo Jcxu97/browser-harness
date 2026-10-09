@@ -65,6 +65,9 @@ Run the example inside an async function when using `js()`:
 ```js
 const video = recordingElement;
 video.pause();
+if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.seeking) {
+  throw new Error('Wait for the current video frame to finish loading before capture');
+}
 if (Math.abs(video.currentTime - targetSeconds) > 0.01) {
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
