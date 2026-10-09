@@ -1,13 +1,13 @@
 # Google Flights — deep-link any search via `tfs` (incl. multi-city)
 
-Do **not** drive the Google Flights UI (autocomplete dropdowns, date pickers, the
-"Multi-city" mode switch). Everything is expressible as a URL:
+Use a search URL for routes that fit the schema below.
+Use the visible controls for filters that the schema does not cover:
 
 ```
 https://www.google.com/travel/flights?tfs=<base64 protobuf>&hl=en&curr=USD
 ```
 
-`tfs` is a base64 (standard alphabet, `=` padding stripped) serialized protobuf.
+`tfs` contains a serialized protobuf encoded as URL-safe base64 without padding.
 
 ## Schema
 
@@ -41,16 +41,19 @@ def vint(n):
 def s(f,v): v=v.encode() if isinstance(v,str) else v; return vint(f<<3|2)+vint(len(v))+v
 def v(f,n): return vint(f<<3)+vint(n)
 def leg(d,a,b): return s(2,d)+s(13,s(2,a))+s(14,s(2,b))
-def tfs(legs,seat=1,trip=3,adults=1):
-    body=b"".join(s(3,leg(*l)) for l in legs)+v(8,1)*adults+v(9,seat)+v(19,trip)
-    return base64.b64encode(body).decode().rstrip("=")
+def tfs(legs, seat=1, trip=3, passengers=(1,)):
+    if not passengers or any(p not in (1, 2, 3, 4) for p in passengers):
+        raise ValueError("Use passenger codes 1, 2, 3, or 4")
+    body = b"".join(s(3, leg(*item)) for item in legs)
+    body += b"".join(v(8, p) for p in passengers) + v(9, seat) + v(19, trip)
+    return base64.urlsafe_b64encode(body).decode().rstrip("=")
 
-# JFK->LHR 2026-03-10, CDG->JFK 2026-03-24, 1 adult, economy, multi-city
-tfs([("2026-03-10","JFK","LHR"),("2026-03-24","CDG","JFK")])
+tfs([("2027-03-10","JFK","LHR"),("2027-03-24","CDG","JFK")])
 ```
 
-Always append `&hl=en&curr=USD` — otherwise currency/locale follow the browser
-profile and prices come back in EUR etc.
+The examples append `&hl=en&curr=USD` for English and US dollars.
+Use the user's requested locale and currency when they differ.
+The extraction example below assumes US dollars.
 
 Verify the URL parsed correctly by reading `page_info()["title"]` — it echoes
 `"<Origin> to <Destination> | Google Flights"`. A malformed `tfs` silently falls
@@ -63,13 +66,13 @@ assuming. Every row is an `<li>`; the whole itinerary is in `li.innerText`:
 
 ```python
 js("""(()=>{const o=[];document.querySelectorAll('li').forEach(l=>{
-  const t=l.innerText; if(t&&/\\$\\d/.test(t)&&t.length<400) o.push(t.replace(/\\n+/g,' | '));
+  const t=l.innerText; if(t&&/\\$\\d/.test(t)) o.push(t.replace(/\\n+/g,' | '));
 });return JSON.stringify(o)})()""")
 ```
 
-Trailing rows in that list can be duplicated detail panes (much longer text) —
-the `length<400` guard drops them. Prefer this over `aria-label` scraping; the
-`jsname`/class attributes are obfuscated and rotate.
+This returns candidate text, including possible nested detail rows.
+Inspect the visible flight cards before counting or quoting results.
+Do not discard rows by text length because valid itineraries can contain long descriptions.
 
 ## Multi-city flow quirks
 
@@ -88,15 +91,17 @@ the `length<400` guard drops them. Prefer this over `aria-label` scraping; the
 
 ## Sorting / expanding
 
-There is no `Show more flights` button on multi-city pages — the list is complete
-as rendered (`Top flights` + `Other flights`). To sort:
+The observed multi-city pages had no `Show more flights` button.
+Check the current page for additional results before treating the visible list as complete.
+To sort:
 
 ```python
-js("[...document.querySelectorAll('button,div[role=button]')].find(x=>/Sorted by/i.test(x.innerText)).click()")
+js("[...document.querySelectorAll('button,div[role=button]')].find(x=>/Sorted by/i.test(x.innerText))?.click()")
 # then
-js("[...document.querySelectorAll('[role=menuitem],li')].find(x=>x.innerText.trim()==='Price').click()")
+js("[...document.querySelectorAll('[role=menuitem],li')].find(x=>x.innerText.trim()==='Price')?.click()")
 ```
 
+Verify the visible sort selection after each click. If the control is absent, wait for rendering and retry.
 Menu options: Top flights, Price, Departure time, Arrival time, Duration, Emissions.
 
 ## Cabin comparison
@@ -118,4 +123,4 @@ Multi-city won by ~25%. Encode the one-ways with `trip=2` and a single leg.
   profile. Google Flights needs no session state, so launching a throwaway Chrome
   with `--user-data-dir=<tmp> --remote-debugging-port=<port>` and pointing
   `BU_CDP_WS` at it is a clean workaround.
-- Prices are per the *whole* itinerary for 1 adult and exclude bag fees.
+- Verify the displayed passenger count and total before quoting a fare. Check bag fees separately.
