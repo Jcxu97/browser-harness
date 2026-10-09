@@ -71,6 +71,7 @@ Note: many `er*` / `erSignup*` / `frontierRegisterMember_*` inputs on this page 
 
 - Agent assist (mandatory): `#ibe-extras-agent-assist-radio-free` (value `AAFF`) vs `#ibe-extras-agent-assist-radio-paid`.
 - Disruption Assistance is in a Hopper iframe at `iframe#iframe_ExtrasDisruptionAssistance` with src `fintech-portal.hts.hopper.com`. Inside: `#option-1` (buy) vs `#none` (decline). Reach via `iframe_target("fintech-portal.hts.hopper.com")`.
+- For a checkout without paid extras, select `#none` inside the Hopper iframe and select the free agent-assist radio. Verify both choices before `.js-extrasSubmitButton`.
 - GoWild pass upsell slider auto-opens and closing with `.close-icon` works here.
 - Submit: `.js-extrasSubmitButton`.
 
@@ -97,7 +98,7 @@ All credit-card inputs are plain DOM (not iframe-tokenized), so `.value = ...` w
 
 ## Fare signal
 
-PHL→MCO on 2026-05-03 showed `$39 Discount Den / $44 Standard` in the `.ibe-farebox-fare-basic` box, matching the "web-exclusive rates" thesis. Fare radios carry the raw fare token in `value` (e.g. `0~Z~~F9~Z07DXD2~CLUB~~0~29~~X|F9~2415~...~PHL~05/03/2026 05:05~MCO~05/03/2026 07:47`).
+The observed PHL→MCO search for 2026-05-03 displayed `$39 Discount Den / $44 Standard`. Those labels do not establish the final purchase price. Select the fare that matches the user’s membership and request. Use its matching Standard or Discount Den continue button. Declining a membership upsell does not grant membership pricing. Verify the selected fare and final total before payment. Fare radios carry the raw fare token in `value` (e.g. `0~Z~~F9~Z07DXD2~CLUB~~0~29~~X|F9~2415~...~PHL~05/03/2026 05:05~MCO~05/03/2026 07:47`).
 
 ## Viewport
 
