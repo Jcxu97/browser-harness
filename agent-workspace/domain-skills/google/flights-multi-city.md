@@ -42,6 +42,9 @@ def s(f,v): v=v.encode() if isinstance(v,str) else v; return vint(f<<3|2)+vint(l
 def v(f,n): return vint(f<<3)+vint(n)
 def leg(d,a,b): return s(2,d)+s(13,s(2,a))+s(14,s(2,b))
 def tfs(legs, seat=1, trip=3, passengers=(1,)):
+    passengers = tuple(passengers)
+    if seat not in (1, 2, 3, 4) or trip not in (1, 2, 3):
+        raise ValueError("Invalid seat or trip code")
     if not passengers or any(p not in (1, 2, 3, 4) for p in passengers):
         raise ValueError("Use passenger codes 1, 2, 3, or 4")
     body = b"".join(s(3, leg(*item)) for item in legs)
