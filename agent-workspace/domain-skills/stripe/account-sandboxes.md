@@ -12,8 +12,9 @@ account's Test mode. Before creating products, prices, or webhooks:
 
 1. Read the account ID from the URL.
 2. Open `/{main_account_id}/test/apikeys`.
-3. Verify the API key by retrieving `/v1/account` and comparing its `id` with
-   the intended main account ID.
+3. Use the intended Test mode secret key for an authenticated `GET https://api.stripe.com/v1/account` request.
+   Send the key in `Authorization: Bearer <test_secret_key>`. Compare the response `id` with the intended main account ID.
+   Keep the key in memory through an authorized secret source. Do not print it or include it in command history.
 
 Useful stable routes:
 
@@ -23,6 +24,4 @@ Useful stable routes:
 - `/{account_id}/test/settings/tax` — Stripe Tax settings
 
 The initial **Business name** onboarding field can replace the display name
-shown in the account switcher. Restore a product-specific display name under
-**Settings → Business → Account details** if the legal name makes sibling
-product accounts indistinguishable.
+shown in the account switcher. Use account IDs to distinguish sibling accounts. Change the display name only when the user requests that change. Use **Settings → Business → Account details** for an authorized change.
