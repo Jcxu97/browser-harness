@@ -11,8 +11,8 @@ re-tested 2026-05-15 from a CN/HK IP without `BROWSER_USE_API_KEY` (see Prerequi
   any IP it doesn't trust — common for VPN, datacenter, or non-US residential IPs.
 - **Fallback when `http_get` fails at the edge:** drive a real Chrome via the harness
   (`new_tab(url)` + `wait_for_load()` + `js("return document.documentElement.outerHTML")`).
-  Chrome inherits the user's geolocation/cookies and is not blocked. The card-level regex
-  parsers below work identically on the resulting HTML.
+  Chrome uses the existing session. Check for a block before extracting data.
+  The parsers below accept both raw HTML and browser-generated HTML.
 
 ## Critical: Bot Detection (two layers)
 
@@ -169,7 +169,7 @@ def extract_search_results(html):
 
     for card in cards[1:]:  # skip preamble before first card
         # Listing ID (dedup)
-        lid_m = re.search(r'data-listingid=(\d+)', card)
+        lid_m = re.search(r'data-listingid=["\']?(\d+)', card)
         if not lid_m:
             continue
         listing_id = lid_m.group(1)
@@ -178,7 +178,7 @@ def extract_search_results(html):
         seen_ids.add(listing_id)
 
         # Item URL (clean, no tracking params)
-        url_m = re.search(r'href=(https://(?:www\.)?ebay\.com/itm/(\d+))', card)
+        url_m = re.search(r'href=["\']?(https://(?:www\.)?ebay\.com/itm/(\d+))', card)
         item_url = url_m.group(1).split('?')[0] if url_m else None
 
         # Title from s-card__title
@@ -199,7 +199,7 @@ def extract_search_results(html):
         original_price = orig_m.group(1).strip() if orig_m else None
 
         # Thumbnail image URL
-        img_m = re.search(r'class=s-card__image[^>]*src=([^\s>]+)', card)
+        img_m = re.search(r'class=["\']?s-card__image[^>]*src=["\']?([^\s>"\']+)', card)
         image = img_m.group(1) if img_m else None
 
         results.append({
@@ -430,9 +430,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 }
-
-def is_blocked(html):
-    return 'Pardon Our Interruption' in html or len(html) < 20_000
 
 # Step 1: Search
 html = http_get(
