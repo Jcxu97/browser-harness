@@ -8,7 +8,7 @@ Open a new tab rather than replacing the user's active tab, then give the Polyme
 
 ```python
 tab = new_tab("https://www.youtube.com/watch?v=<VIDEO_ID>")
-wait_for_load(tab)
+wait_for_load()
 wait(4)
 ```
 
@@ -79,15 +79,14 @@ Avoid coordinate clicks here. The description height and transcript-button posit
 
 ## Extract the rendered transcript
 
-For the standard English desktop UI, the panel text begins at `Transcript\nSearch transcript`. Reading `innerText` after the panel opens returns the timestamps and caption lines in display order:
+Read only the visible transcript panel. Keep its timestamps and caption lines in display order:
 
 ```python
 transcript = js("""
 (() => {
-  const text = document.body.innerText;
-  const marker = 'Transcript\\nSearch transcript';
-  const start = text.indexOf(marker);
-  return start >= 0 ? text.slice(start) : null;
+  const panel = [...document.querySelectorAll('ytd-transcript-renderer')]
+    .find(el => el.getClientRects().length);
+  return panel ? panel.innerText : null;
 })()
 """, target_id=tab)
 ```
@@ -99,4 +98,4 @@ Treat auto-generated captions as fallible, especially for names, dates, numbers,
 - `Show transcript` is missing: expand the description first, then wait for the action row to render.
 - JavaScript returns metadata from the wrong video: pass the watch tab's `target_id` on every call.
 - A hidden duplicate receives the click: require `getClientRects().length` for both the expansion control and transcript text leaf.
-- The marker is absent: the UI may be localized, captions may be unavailable, or the panel may still be loading. Inspect the screenshot before changing selectors.
+- The transcript panel is absent: the UI may be localized, captions may be unavailable, or the panel may still be loading. Inspect the screenshot before changing selectors.
