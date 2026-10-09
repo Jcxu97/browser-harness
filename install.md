@@ -1,105 +1,120 @@
 ---
-name: browser-harness-install
-description: Install and bootstrap browser-harness into the current agent, then connect it to the user's real Chrome with minimal prompting.
+name: browser-install
+description: Install browser-harness and connect it to a browser fast.
 ---
 
 # browser-harness install
 
-Use this file only for first-time install, reconnect, or cold-start browser bootstrap. For day-to-day browser work, read `SKILL.md`. Always read `helpers.py` after cloning; that is where the functions and expected patterns live.
+Use once. For browser work, read `SKILL.md`.
 
-## Install prompt contract
-
-When you open a setup or verification tab, activate it so the user can actually see the active browser tab.
-
-## Best everyday setup
-
-Clone the repo once into a durable location, then install it as an editable tool so `browser-harness` works from any directory:
+## Fast Path
 
 ```bash
-git clone https://github.com/browser-use/browser-harness
-cd browser-harness
-uv tool install -e .
-command -v browser-harness
-```
-
-That keeps the command global while still pointing at the real repo checkout, so when the agent edits `helpers.py` the next `browser-harness` uses the new code immediately. Prefer a stable path like `~/Developer/browser-harness`, not `/tmp`.
-
-## Make it global for the current agent
-
-After the repo is installed, register this repo's `SKILL.md` with the agent you are using:
-
-- **Codex**: add this file as a global skill at `$CODEX_HOME/skills/browser-harness/SKILL.md` (often `~/.codex/skills/browser-harness/SKILL.md`). A symlink to this repo's `SKILL.md` is fine.
-- **Claude Code**: add an import to `~/.claude/CLAUDE.md` that points at this repo's `SKILL.md`, for example `@~/src/browser-harness/SKILL.md`.
-
-Codex command:
-
-```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness" && ln -sf "$PWD/SKILL.md" "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness/SKILL.md"
-```
-
-That makes new Codex or Claude Code sessions in other folders load the runtime browser harness instructions automatically. An empty `~/.codex/skills/browser-harness/` directory is fine; the symlink command above populates it.
-
-## Browser bootstrap
-
-1. Run `uv sync`.
-   If `browser-harness` is still missing after that, run `command -v browser-harness >/dev/null || uv tool install -e .`.
-2. First try the harness directly. If this works, skip manual browser setup:
-
-```bash
-uv run browser-harness <<'PY'
+uv tool install --python 3.12 --upgrade --force browser-harness
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness"
+browser-harness skill > "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness/SKILL.md"
+browser-harness <<'PY'
 print(page_info())
 PY
 ```
 
-   Reuse an existing healthy daemon if it is already responding. Do not kill it during setup unless the attach is clearly stale and you are confident no other agent is using the same `BU_NAME`. For parallel agents, use distinct `BU_NAME`s so they do not fight over the same default session.
+If `page_info()` prints, configure recording consent below, then stop.
 
-3. If it failed, **read the error and escalate from there — do not assume you need `chrome://inspect`**. The remote-debugging checkbox is per-profile sticky in Chrome, so any profile that has had it toggled on once will auto-enable CDP on every future launch; the inspect page is only needed the first time per profile.
+`--python 3.12` prevents uv from selecting old releases that support older Python versions. `--upgrade --force` replaces any previous `browser-harness` tool install with the latest stable release. It does not uninstall unrelated commands such as `browser-use-Browser` or `browser-use-Terminal`.
 
-   - **No Chrome process running** → just start Chrome and re-run the harness. On macOS: `open -a "Google Chrome"`. Do *not* navigate to `chrome://inspect` yet — if the user has ever ticked the checkbox on this profile, the harness will attach on its own.
-   - **`DevToolsActivePort` missing or empty after Chrome is up** → remote-debugging has never been enabled on this profile. *This* is when you open `chrome://inspect/#remote-debugging` and ask the user to tick the checkbox and click `Allow`. Once ticked, the setting sticks.
-   - **Port present but `connection refused` / `DevTools not live yet` / `/json/version` 404** → Chrome is mid-startup. Just keep polling for up to 30 seconds; do not restart Chrome and do not open the inspect page.
-   - **`no close frame received or sent` / stale websocket** → the daemon (not Chrome) is the problem. Run `restart_daemon()` once and retry — see step 7 below.
+For Claude Code or other agents: install `browser-harness`, register a skill named `browser-harness`, use `browser-harness skill` as the body, and use this trigger:
 
-   When you do need to open the inspect page on macOS and Chrome is already running, prefer AppleScript so it reuses the current profile instead of going through the picker:
-
-```bash
-osascript -e 'tell application "Google Chrome" to activate' \
-          -e 'tell application "Google Chrome" to open location "chrome://inspect/#remote-debugging"'
+```text
+Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work.
 ```
 
-   On Linux: open that URL manually in the existing Chrome window.
-   If Chrome shows the profile picker first, tell the user to choose their normal profile, *then* (only if `DevToolsActivePort` is still missing) open the inspect page in that profile. Keep polling instead of waiting for the user to type a follow-up.
-4. Be explicit with the user about the two possible Chrome actions: choose their normal profile if the profile picker is open, and in the remote-debugging tab tick the checkbox and click `Allow` once if Chrome shows it.
-5. Try to do everything yourself. Only ask the user to do something if it is truly necessary, like selecting the Chrome profile or clicking `Allow`. While the user is doing that, sleep and check every 3 seconds whether it is completed. After asking, keep retrying for at least 30 seconds even if you see connection-refused, stale websocket, or other weird transient attach errors.
-6. If setup still lands on the profile picker, have the user choose their normal profile, then (only if `DevToolsActivePort` is still missing) open `chrome://inspect/#remote-debugging` in that profile and keep polling instead of restarting the explanation. As soon as attach succeeds, continue immediately with the verification task without asking again.
-7. Verify with:
+If an old user-installed `browser` or `browser-use` skill is being picked instead, remove that stale skill directory manually. Do not edit bundled/vendor plugin caches.
+
+## Recording Consent
+
+Run `browser-harness recordings`. If it reports `(default)`, ask the user once:
+
+> Enable local browser recordings? This saves screenshots and action traces on
+> this machine, which may include sensitive page content, so you can later ask
+> “show me what you did” or request a video. Videos are never generated
+> automatically. [y/N]
+
+Default to no. Run `browser-harness recordings enable` only after yes; otherwise
+run `browser-harness recordings disable`. Preserve an existing `(config)` or
+`(BH_RECORD)` preference during upgrades instead of asking again.
+
+## If Chrome Blocks It
+
+In Chrome:
+
+1. Open `chrome://inspect/#remote-debugging`.
+2. Tick "Allow remote debugging for this browser instance".
+3. Retry `page_info()`.
+
+If that reports `permission-blocked` on macOS, handle the per-connection Allow
+sheet without bringing Chrome to the foreground:
 
 ```bash
-uv run browser-harness <<'PY'
-goto("https://github.com/browser-use/browser-harness")
-wait_for_load()
+browser-harness mac-approve
+```
+
+Continue browser work when the helper returns `ready`; otherwise follow its
+printed instruction. The first checkbox is intentionally a one-time manual
+Chrome setup step; it is not exposed to the harness until CDP is available.
+
+The helper requires Accessibility permission for the app launching the CLI
+(for example Terminal, iTerm, Codex, or an IDE) in System Settings.
+
+## Cloud Browsers
+
+Cloud is optional. Local Chrome does not need a Browser Use API key.
+
+Use any short made-up name; `r7k2` below is just a placeholder.
+
+```bash
+browser-harness auth login
+browser-harness <<'PY'
+start_remote_daemon("r7k2")
+PY
+```
+
+Then use it by name:
+
+```bash
+BU_NAME=r7k2 browser-harness <<'PY'
 print(page_info())
 PY
 ```
 
-If that fails with a stale websocket or stale socket, restart the daemon once and retry:
+## If Still Broken
 
 ```bash
-uv run python - <<'PY'
-from admin import restart_daemon
-restart_daemon()
-PY
+browser-harness --doctor
 ```
 
-8. After install and browser bootstrap succeed, navigate to `https://github.com/browser-use/browser-harness` so the user can see the harness has attached to their browser. If the user is logged in to GitHub, **ask the user whether you should star the repo for them** as a quick demo that the interaction works — only click the star if they say yes. Then ask the user what they want to do next.
+Use the output:
 
-## Cold-start reminders
+- `chrome running` FAIL: ask the user to open Chrome, or use isolated/cloud browser.
+- `daemon alive` FAIL: Chrome remote debugging permission is missing, Chrome is closed, or the CDP endpoint is not reachable.
+- update available: run `browser-harness --update -y` when you decide to upgrade.
 
-- Try attaching before asking the user to change anything. Decide what to escalate based on the harness's error message, not on whether Chrome is visibly running.
-- The remote-debugging checkbox is per-profile sticky in Chrome. If it has ever been ticked on a profile, just launching Chrome is enough — only navigate to `chrome://inspect/#remote-debugging` when `DevToolsActivePort` is genuinely missing.
-- The first connect may block on Chrome's `Allow` dialog, and Chrome may also stop first on the profile picker.
-- `DevToolsActivePort` can exist before the port is actually listening. Treat connection refused as "still enabling" and keep polling briefly.
-- If the port is listening but `/json/version` returns `404`, treat that as expected on newer Chrome builds and retry `browser-harness`.
-- Chrome may open the profile picker before any real tab exists.
-- On macOS, prefer AppleScript `open location` over `open -a ... URL` when Chrome is already running.
-- Microsoft Edge (including Beta/Dev/Canary) works too — substitute the app name; steps are identical.
+For a machine-readable health check, an orchestrator can set `BU_NAME` to an
+already-provisioned daemon and run:
+
+```bash
+browser-harness doctor --json --require-existing-daemon
+```
+
+This prints a versioned JSON report and exits nonzero unless that exact daemon
+has a live browser connection. It never starts or discovers another browser.
+
+If this still fails, inspect `src/browser_harness/admin.py`, `src/browser_harness/daemon.py`, and `src/browser_harness/_ipc.py`.
+
+Useful:
+
+```bash
+browser-harness --update -y
+browser-harness telemetry disable
+```
+
+State lives under `${XDG_CONFIG_HOME:-~/.config}/browser-harness` by default: auth, telemetry id, agent workspace, runtime sockets, logs, screenshots, and temp files. Override with `BH_HOME` or `BROWSER_HARNESS_HOME`.
