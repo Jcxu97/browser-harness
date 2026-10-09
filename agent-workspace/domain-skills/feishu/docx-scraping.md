@@ -34,6 +34,7 @@ FIND = """
             :{m:'win',sh:document.documentElement.scrollHeight,ch:window.innerHeight};
 })()
 """
+js(FIND)
 ```
 实测返回形如 `{'m':'el','sh':8054,'ch':769}`。之后统一用 `window.__sc.scrollTop += N` 滚动。
 
@@ -43,6 +44,8 @@ FIND = """
 
 ```python
 import time
+js("window.__sc.scrollTop = 0")
+time.sleep(0.75)
 seen, lines = set(), []
 idle = 0
 for i in range(500):
@@ -60,7 +63,9 @@ for i in range(500):
     current = js("window.__sc.scrollTop")
     idle = idle + 1 if current == state["top"] else 0
     if idle >= 4:
-        break
+        raise RuntimeError("Document scrolling stopped before the end")
+else:
+    raise RuntimeError("Document capture reached its iteration limit")
 
 ```
 - 步长取 `clientHeight * 0.8` 左右，留重叠，避免漏块。
