@@ -29,7 +29,7 @@ To rename an existing search, open the view selector, hover its row, open the el
 
 Apollo is a React application. `wait_for_load()` does not guarantee that a search, list, or AI response has finished updating. Check the visible result and completion toast after each mutation.
 
-After bulk company saves, the current search can temporarily show duplicate saved/unsaved rows and inflated counts. The lists overview can show zero records while the individual list already has records. Verify the individual list and, if needed, reload the page with `Page.reload` before interpreting counts. Navigating to the same hash URL may not reload the application.
+After bulk company saves, the current search can temporarily show duplicate saved/unsaved rows and inflated counts. The lists overview can show zero records while the individual list already has records. Verify the individual list and, if needed, reload the page with `cdp("Page.reload")` before interpreting counts. Navigating to the same hash URL may not reload the application.
 
 Lists created in another tab may not immediately appear in an already-open list picker, even after closing and reopening the dialog. A full reload refreshes this cache, but loses unsaved selection. Finish or record the selection before reloading.
 
