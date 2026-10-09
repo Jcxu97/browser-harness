@@ -3,12 +3,14 @@
 Fetching files behind a Slack workspace login, given a permalink like
 `https://<ws>.slack.com/files/<USERID>/<FILEID>/<name>`.
 
+The contributor supplied these internal API observations without a validation date. Verify each response before relying on its fields.
+
 Current discovery uses the first hostname label, which can be the workspace name or `app`.
 Read this file directly for Slack file tasks when automatic discovery does not list it.
 
 Only download files that the user requests and their session can access.
 Keep cookies and tokens in memory. Never print them or put them in command arguments, files, or logs.
-Send credentials only to the verified Slack workspace and Slack file hosts.
+Allow credential requests only to the requested `<ws>.slack.com` workspace and `files.slack.com` over HTTPS. Check the parsed hostname before each request. Disable automatic redirects for credential requests. Validate each redirect destination before following it; never forward cookies or tokens to another host.
 
 ## URL structure
 
@@ -29,7 +31,9 @@ Send credentials only to the verified Slack workspace and Slack file hosts.
 
    ```python
    r = cdp("Network.getCookies", urls=["https://<ws>.slack.com/"])
-   d = next(c["value"] for c in r["cookies"] if c["name"] == "d")
+   d = next((c["value"] for c in r["cookies"] if c["name"] == "d"), None)
+   if d is None:
+       raise RuntimeError("Sign in to the requested Slack workspace before downloading its files")
    ```
 
 2. Fetching the permalink HTML with that cookie (an in-process HTTP request, no browser needed)
@@ -39,7 +43,7 @@ Send credentials only to the verified Slack workspace and Slack file hosts.
 
 3. API calls: POST to `https://<ws>.slack.com/api/<method>` with `token=<xoxc>` as a form
    field **and** the `d` cookie — xoxc web tokens are only valid together with the cookie.
-   `files.info`, `files.list`, `search.files` all work.
+   The contributor used `files.info`, `files.list`, and `search.files`. These internal session flows can change; inspect API errors before continuing.
 
 4. Download `url_private` (or the files-pri URL) with just the `d` cookie.
 
@@ -47,5 +51,4 @@ Send credentials only to the verified Slack workspace and Slack file hosts.
 
 - The permalink page in a real browser tab sticks on "Redirecting…" forever (it's waiting
   to open the desktop app) — don't wait for it; you only need it as an HTML fetch.
-- `files.list` sorts/filters in ways that can silently omit recent files; when a named
-  file must be found, `search.files` is the reliable path.
+- File lists and searches can omit results because of filtering or delayed indexing. Prefer `files.info` when the user supplies a file ID. Treat an empty search as inconclusive and inspect the workspace UI.
