@@ -12,7 +12,7 @@ The editor state lives entirely in the URL hash, **not** a query param:
 https://mermaid.live/edit#pako:<data>
 ```
 
-`<data>` is the editor state JSON, **raw-deflated (zlib) then URL-safe base64**. It is
+`<data>` is the editor state JSON, **zlib-compressed then URL-safe base64**. It is
 NOT plain base64 of the code — skipping the deflate step gives a blank editor. Build it
 in Python (the harness already runs Python):
 
@@ -33,17 +33,16 @@ decoder is tolerant.
 
 ## Confirming the render (headless-safe, no screenshot needed)
 
-`screenshot()` returns image bytes the agent can look at, but if you're driving the
-harness from a shell you only get stdout — so verify via the DOM instead. On a **good**
-render mermaid.live injects an `<svg id="graph-...">` with many `<g>` groups; on a
-**syntax error** it shows an error string and no real graph.
+`capture_screenshot()` saves an image for visual inspection.
+Check the page structure for a graph, then inspect the image when appearance matters.
 
 ```python
 new_tab(mermaid_live_url(code)); wait_for_load()
 import time; time.sleep(2)   # mermaid renders client-side after load
 print(js("""(() => {
-  const svgs=[...document.querySelectorAll('svg')]
-    .map(s=>({id:s.id,nodes:s.querySelectorAll('g').length})).filter(s=>s.nodes>5);
+  const svgs=[...document.querySelectorAll('svg[id^="graph-"]')]
+    .filter(s => s.getClientRects().length)
+    .map(s=>({id:s.id,nodes:s.querySelectorAll('g').length}));
   return JSON.stringify({rendered:svgs,
     syntaxErr:/syntax error|parse error/i.test(document.body.innerText||'')});
 })()"""))
@@ -51,13 +50,14 @@ print(js("""(() => {
 # rendered:[] (or only tiny svgs) + syntaxErr:true         => broken Mermaid
 ```
 
-A diagram of any real size yields dozens+ of `<g>` nodes; `>5` filters out the page's
-own UI icons (toolbar SVGs report `width="1.2em"` and ~0 `<g>`).
+Check that the editor contains the submitted code before treating a graph as the requested result.
+Use the graph ID prefix to exclude toolbar icons.
+Do not reject small diagrams based on group count.
 
 ## Traps
 
 - **`#pako:` is a hash, not a query.** `wait_for_load()` won't catch the client-side
   render — add a short `time.sleep`.
-- **Don't trust "no error text" alone** — also require a real `<svg>` with many nodes.
+- **Do not trust error text alone.** Require a visible graph SVG that matches the submitted code.
   A blank editor (bad encoding) shows neither an error nor a graph.
 - Theme/look-and-feel never affects parse success; keep the `mermaid` state minimal.
