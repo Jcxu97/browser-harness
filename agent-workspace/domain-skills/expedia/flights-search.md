@@ -41,21 +41,14 @@ URL parameters:
 
 ### Navigation in browser-harness
 
-Use the `goto_url()` + `new_tab()` fallback pattern — the pre-filled URL
-already loads results directly, no Search button click needed:
+Open the search in a task tab. The pre-filled URL loads results directly; no Search button click is needed:
 
 ```python
 search_url = "https://www.expedia.ca/Flights-Search?flight-type=roundtrip&mode=search&trip=roundtrip&leg1=from:YYZ,to:ICN,departure:2027/07/03TANYT&leg2=from:ICN,to:YYZ,departure:2027/07/25TANYT&passengers=adults:1&options=cabin:economy&sort=price%3Aa"
-try:
-    goto_url(search_url)
-    wait_for_load(timeout=25)
-    if not js('!!document.querySelector("[data-stid*=listing]")'):
-        raise RuntimeError("No flight listings appeared")
-except Exception:
-    new_tab(search_url)
-    wait_for_load(timeout=25)
-    if not js('!!document.querySelector("[data-stid*=listing]")'):
-        raise RuntimeError("Flight listings are still absent; inspect the page")
+new_tab(search_url)
+wait_for_load(timeout=25)
+if not js('!!document.querySelector("[data-stid*=listing]")'):
+    raise RuntimeError("Flight listings are absent; inspect the search tab before continuing")
 ```
 
 **CRITICAL: Do NOT click the Search button.** The pre-filled URL already
