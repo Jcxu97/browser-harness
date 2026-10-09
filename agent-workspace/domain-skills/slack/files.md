@@ -40,6 +40,7 @@ Allow credential requests only to the requested `<ws>.slack.com` workspace and `
    yields a page embedding `"api_token":"xoxc-…"` and `team_id = "T…"`. No need to load
    `app.slack.com` or dig through localStorage (`localConfig_v2` only exists on the
    `app.slack.com` origin anyway).
+   Require both fields in the response. Compare `team_id` with the requested workspace ID from its signed-in UI. Stop if the workspace differs or either field is absent; a Slack cookie alone does not prove workspace access.
 
 3. API calls: POST to `https://<ws>.slack.com/api/<method>` with `token=<xoxc>` as a form
    field **and** the `d` cookie — xoxc web tokens are only valid together with the cookie.
