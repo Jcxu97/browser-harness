@@ -337,18 +337,15 @@ appear on browse pages only.
 
 ### Default location for visitors Walmart can't place
 
-Walmart can't place any non-US IP, and then `countryRegion.countryCode` is `"not-available"`.
-Such a visitor always gets the same default location:
-**ZIP 95829, store 3081 (Sacramento, CA)**, flagged `isDefaulted=true` in the
-`searchResult.debug.sisUrl` query string. The search itself then runs with
-`zipcode=94066&extended_zipcode=95829`. A desktop browser outside the US shows
-"Sacramento, 95829" in the header for the same reason.
+In the documented Israeli-exit session, `countryRegion.countryCode` returned `"not-available"`.
+Walmart assigned **ZIP 95829, store 3081 (Sacramento, CA)**.
+The `searchResult.debug.sisUrl` query included `isDefaulted=true` and `zipcode=94066&extended_zipcode=95829`.
+Use `pageMetadata.location.postalCode` for the served ZIP; the internal `zipcode` parameter differs.
 
-To keep results comparable across runs and sessions, send every request from one fixed
-non-US country, for example a proxy exit in IL. Each session then lands on 95829 / store 3081.
-US residential IPs each get their nearest store, and the results reorder from session
-to session. Always check `pageMetadata.location.postalCode` on every page, whatever the proxy
-promises, and drop a session that comes back with a different ZIP.
+This observation covers one session in one country. It does not establish behavior across sessions or countries.
+Check `pageMetadata.location.postalCode` and the store ID on every page.
+For comparisons, keep only pages with the intended ZIP and store ID.
+A fixed proxy country alone does not establish matching locations.
 
 Field-tested 2026-09-26 through the Bright Data Scraping Browser with `-country-il`:
 10 consecutive browse pages in one session all served 95829 / 3081.
