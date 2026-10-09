@@ -3,12 +3,7 @@
 Search URL (no login needed):
 
 ```
-https://www.airbnb.com/s/San-Francisco--CA--United-States/homes
-  ?refinement_paths[]=/homes&checkin=2026-10-11&checkout=2026-11-11&adults=2
-  &min_bedrooms=2&room_types[]=Entire home/apt
-  &ne_lat=37.812&ne_lng=-122.405&sw_lat=37.778&sw_lng=-122.460&search_by_map=true&zoom=14
-  &search_type=filter_change
-  &price_max=7000&price_filter_num_nights=31          # optional
+https://www.airbnb.com/s/San-Francisco--CA--United-States/homes?refinement_paths%5B%5D=%2Fhomes&checkin=2026-10-11&checkout=2026-11-11&adults=2&min_bedrooms=2&room_types%5B%5D=Entire%20home%2Fapt&ne_lat=37.812&ne_lng=-122.405&sw_lat=37.778&sw_lng=-122.460&search_by_map=true&zoom=14&search_type=filter_change&price_max=7000&price_filter_num_nights=31
 ```
 
 - With a 28+ night range, cards show a **monthly** figure ("$5,860 → $5,679 monthly") that
@@ -25,12 +20,17 @@ https://www.airbnb.com/s/San-Francisco--CA--United-States/homes
 
 The observed page contained 18 cards. The "Next" button click failed intermittently.
 Use the cursor parameter with the original `search_url`, which contains filters but no pagination parameters.
-Increase `page_number` for each page and check for repeated listing IDs:
+Open the filtered search first. This example builds page two from its current URL. Set `page_number` to 3, 4, and subsequent pages as needed. Check for repeated listing IDs after each page:
 
 ```python
 import base64, json
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
+current = urlsplit(page_info()["url"])
+if current.hostname != "www.airbnb.com" or "/homes" not in current.path:
+    raise RuntimeError("Open the filtered Airbnb search before requesting another page")
+query = [(key, value) for key, value in parse_qsl(current.query) if key not in ("cursor", "items_offset")]
+search_url = urlunsplit((current.scheme, current.netloc, current.path, urlencode(query), ""))
 page_number = 2
 offset = (page_number - 1) * 18
 cur = base64.b64encode(json.dumps({"section_offset": 0, "items_offset": offset, "version": 1}).encode()).decode()
