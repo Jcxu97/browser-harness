@@ -52,13 +52,10 @@ press_key("Enter")
 
 Use `press_key("Delete")` before each `Tab` or `Enter` commit after typing a text value. This removes any selected autocomplete suffix. Verify the resulting cells through the export.
 
-## Auth note: Google session cookies rotate fast
+## Authentication and export failures
 
-If you drive Sheets with exported-and-injected Chrome cookies, re-export them immediately before the
-run. Google rotates `__Secure-1PSIDTS` within hours. A stale export does **not** present as a login
-error — you land on the account chooser, which renders every account as "Signed out" while returning
-**HTTP 200**, so it reads as a working page. The failure surfaces much later as a bare `401` from
-the CSV export endpoint.
+Use the existing authorized browser session for the sheet and its CSV export. Do not export session cookies for this workflow.
 
-Cookies for other sites in the same export (LinkedIn, X) stay valid for days, so "the export works"
-is not evidence that the Google half of it does.
+An HTTP 200 response can contain an account chooser instead of spreadsheet data. Check the response type and contents before comparing cells. If the export returns a login page or HTTP 401, restore authentication in the browser and retry the export.
+
+Do not print session cookies or include them in scripts, logs, or reusable skills.
