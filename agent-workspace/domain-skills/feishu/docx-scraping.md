@@ -45,7 +45,7 @@ js(FIND)
 ```python
 import time
 js("window.__sc.scrollTop = 0")
-time.sleep(0.75)
+time.sleep(9)
 seen, lines = set(), []
 idle = 0
 for i in range(500):
@@ -107,7 +107,7 @@ Be the first to like this
 另外正文里普遍插入零宽字符，先清掉再比对：
 
 ```python
-t.replace("​","").replace("﻿","").replace("⁠","")
+t = t.replace("​","").replace("﻿","").replace("⁠","")
 ```
 文档标题尤其明显——`extract-meta.json` 里抓到的 title 前缀是几十个零宽字符。
 
