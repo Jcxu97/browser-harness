@@ -49,8 +49,11 @@ If the response is briefly absent, wait for hydration and retry before falling b
 3. Wait for the side panel to render.
 
 ```python
-js("""
+expanded = js("""
 (() => {
+  const transcriptButton = [...document.querySelectorAll('button, tp-yt-paper-button')]
+    .find(el => el.getClientRects().length && el.innerText.trim() === 'Show transcript');
+  if (transcriptButton) return true;
   const expand = [...document.querySelectorAll('tp-yt-paper-button#expand')]
     .find(el => el.getClientRects().length);
   if (!expand) return false;
@@ -58,9 +61,11 @@ js("""
   return true;
 })()
 """, target_id=tab)
+if not expanded:
+    raise RuntimeError("Inspect the description before opening its transcript")
 wait(1)
 
-js("""
+opened = js("""
 (() => {
   const leaf = [...document.querySelectorAll('body *')]
     .find(el => el.children.length === 0 &&
@@ -72,6 +77,8 @@ js("""
   return true;
 })()
 """, target_id=tab)
+if not opened:
+    raise RuntimeError("The transcript control is absent; inspect the page before retrying")
 wait(2)
 ```
 
@@ -90,6 +97,8 @@ transcript = js("""
 })()
 """, target_id=tab)
 ```
+
+If `transcript` is empty, inspect the panel and retry before reporting a transcript.
 
 Treat auto-generated captions as fallible, especially for names, dates, numbers, and technical terms. Preserve timestamps when a questionable claim needs to be checked against the audio.
 
