@@ -12,7 +12,7 @@ account's Test mode. Before creating products, prices, or webhooks:
 1. Confirm the intended account in the account switcher and read its ID from account settings.
 2. Open Test mode and its API keys page. Do not infer account identity from the URL alone.
 3. Use the intended Test mode secret key for an authenticated `GET https://api.stripe.com/v1/account` request.
-   Send the key in `Authorization: Bearer <test_secret_key>`. Compare the response `id` with the intended main account ID.
+   Send the key in `Authorization: Bearer <test_secret_key>`. Compare the response `id` with the account ID confirmed in step 1, whether main or sandbox.
    Keep the key in memory through an authorized secret source. Do not print it or include it in command history.
 
 Account-specific routes use the verified account ID. Current-account routes omit that prefix:
