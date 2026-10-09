@@ -1,10 +1,9 @@
 # DoorDash — cross-store product search, product pages, store info (logged-in Chrome)
 
-Field-tested 2026-09-26 against `doordash.com` (US) from a real, logged-in desktop Chrome through
-browser-harness. ~600 searches, ~100 product pages. Complements `scraping.md` (one store's catalog
-through an unlocker proxy): here the browser *is* the unlocker, and every call is an in-page `fetch()`
-from any open `doordash.com` tab — no navigation, no clicks, the user's session and delivery address
-ride along automatically.
+The contributor tested `doordash.com` on 2026-09-26 through browser-harness with a logged-in desktop Chrome session.
+The contributor reports approximately 600 searches and 100 product pages.
+Each request uses in-page `fetch()` from an open `doordash.com` tab.
+The requests use the existing session and delivery address.
 
 ---
 
