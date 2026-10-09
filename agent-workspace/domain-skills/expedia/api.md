@@ -18,7 +18,7 @@ GET https://www.expedia.mx/api/v4/typeahead/{url-encoded query}
   `regionNames.shortName`/`fullName`, and `coordinates.lat/long`.
 - Querying `"{hotel name} {city}"` reliably puts the right property first;
   retry with the bare hotel name if the combined query returns nothing.
-- 10× faster and more robust than scraping the search results page.
+- The contributor reports a 10× speed improvement over search-page extraction. The report includes no paired timings.
 
 ## Property page URLs
 
