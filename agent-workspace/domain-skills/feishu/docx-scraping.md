@@ -2,6 +2,9 @@
 
 抓 `*.feishu.cn/docx/<token>` 的正文与配图。连接用户已登录的 Chrome 即可，无需处理登录。
 
+Current discovery uses the first hostname label, which can be the tenant name.
+Read this file directly for Feishu document tasks when automatic discovery does not list it.
+
 ## URL 形状
 
 ```
@@ -26,7 +29,7 @@ FIND = """
     if((s.overflowY==='auto'||s.overflowY==='scroll') && el.scrollHeight>el.clientHeight+200){
       if(el.scrollHeight>bh){bh=el.scrollHeight;best=el;}
     }});
-  window.__sc=best;
+  window.__sc=best || document.scrollingElement;
   return best?{m:'el',sh:best.scrollHeight,ch:best.clientHeight}
             :{m:'win',sh:document.documentElement.scrollHeight,ch:window.innerHeight};
 })()
@@ -39,15 +42,26 @@ FIND = """
 滚出视口的块会被卸载，`innerText` 只返回**当前渲染**的部分。一次性读拿不到全文。做法：小步滚动 + 逐行去重累积。
 
 ```python
+import time
 seen, lines = set(), []
+idle = 0
 for i in range(500):
     for ln in js("document.body.innerText").split("\n"):
         s = ln.strip()
         if s and s not in seen:
-            seen.add(s); lines.append(s)
-    st = js("(()=>{window.__sc.scrollTop+=500; return {top:window.__sc.scrollTop,sh:window.__sc.scrollHeight,ch:window.__sc.clientHeight}})()")
+            seen.add(s)
+            lines.append(s)
+    state = js("({top:window.__sc.scrollTop,sh:window.__sc.scrollHeight,ch:window.__sc.clientHeight})")
+    if state["top"] + state["ch"] >= state["sh"] - 5:
+        break
+    step = max(1, int(state["ch"] * 0.8))
+    js(f"window.__sc.scrollTop += {step}")
     time.sleep(0.75)
-    if st['top']+st['ch'] >= st['sh']-5: break
+    current = js("window.__sc.scrollTop")
+    idle = idle + 1 if current == state["top"] else 0
+    if idle >= 4:
+        break
+
 ```
 - 步长取 `clientHeight * 0.8` 左右，留重叠，避免漏块。
 - 每步之间 sleep ≥ 0.7s，否则新块还没渲染就读了。
