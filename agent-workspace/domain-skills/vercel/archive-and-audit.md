@@ -9,7 +9,7 @@ Use the existing authenticated browser for project dashboards; prefer the public
 - Project analytics: `https://vercel.com/<team>/<project>/analytics`.
 - Production Deployment on the overview exposes the source repository, branch, abbreviated commit, full commit link, deployment domain, and creation date. Compare the full commit with the archived Git checkout; do not assume default-branch HEAD is deployed.
 - A 404 on a known team route may be **account mismatch**, not a missing project. Read the rendered account identity after hydration.
-- Multiple logged-in Chrome profiles can expose tabs through one debugging connection. `Target.createTarget` may open in the default profile, even while tabs from another profile are visible. For Linux profile selection, use the user's existing Chrome with `google-chrome --profile-directory='<known profile directory>' --new-tab '<url>'`, then identify the newly created target and attach. Read only profile-name/email metadata to map a user-requested profile; do not copy its credential store.
+- Use an existing tab from the intended Chrome profile. `Target.createTarget` does not guarantee that profile. Verify the visible Vercel account before reading project data. If no matching tab exists, ask the user to open the intended profile. Do not copy its credential store.
 - Navigation completion is not dashboard hydration completion. After `wait_for_load()`, verify the visible account/project text and take a new screenshot before concluding that a team is unavailable.
 
 ## Read-only audit boundaries
