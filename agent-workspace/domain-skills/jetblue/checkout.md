@@ -92,12 +92,21 @@ These are **out-of-process iframes (OOPIF)**. Compositor-level coordinate clicks
 What works: **attach to each OOPIF's CDP target and dispatch key events against the iframe's own session.**
 
 Use `card_number` from the authorized task input. Never log its value.
-Repeat the same attach, type, and detach sequence for `cvv_id`.
+For the CVV, repeat the frame lookup and session cleanup with `#tx_iframe_cvv_tokenex-security-code-container`. Verify its TokenEx host before typing.
 
 ```python
-targets = cdp("Target.getTargets")
-pan_id  = next(t['targetId'] for t in targets['targetInfos'] if 'tokenex' in t.get('url','') and 'Mode=Data' in t['url'])
-cvv_id  = next(t['targetId'] for t in targets['targetInfos'] if 'tokenex' in t.get('url','') and 'Mode=CVV'  in t['url'])
+from urllib.parse import urlsplit
+
+if urlsplit(page_info()["url"]).hostname != "www.jetblue.com":
+    raise RuntimeError("Select the authorized JetBlue checkout tab first")
+pan_url = js("document.querySelector('#tx_iframe_tokenex-card-number-container')?.src ?? null")
+if not pan_url or urlsplit(pan_url).hostname != "htp.tokenex.com":
+    raise RuntimeError("The expected TokenEx card frame is not ready")
+targets = cdp("Target.getTargets")["targetInfos"]
+matching = [t for t in targets if t["type"] == "iframe" and t.get("url") == pan_url]
+if len(matching) != 1:
+    raise RuntimeError("The checkout card frame does not identify exactly one target")
+pan_id = matching[0]["targetId"]
 
 # The payment frame needs its own session for keyboard events.
 pan_session = cdp("Target.attachToTarget", targetId=pan_id, flatten=True)['sessionId']
