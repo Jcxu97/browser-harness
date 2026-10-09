@@ -26,9 +26,16 @@ eBay sits behind two independent block layers. The skill must detect both:
    **5–10 requests per IP in a short window** once the edge has let you in. The block
    page is ~13 KB and contains no listing data.
 
+Run these examples through browser-harness, which provides `http_get`. Define `HEADERS`, `is_blocked`, and `safe_get` before the extraction and pagination examples. Keep those definitions in the same script.
+
 **Always check before parsing:**
 ```python
 import urllib.error
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 def is_blocked(html_or_exc):
     """Detect both Akamai edge blocks (HTTPError) and the in-page interstitial."""
@@ -216,7 +223,6 @@ def extract_search_results(html):
 
 **Usage:**
 ```python
-from helpers import http_get
 import re
 
 HEADERS = {
@@ -224,7 +230,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-html = http_get("https://www.ebay.com/sch/i.html?_nkw=mechanical+keyboard&LH_BIN=1&_sop=15", headers=HEADERS)
+html = safe_get("https://www.ebay.com/sch/i.html?_nkw=mechanical+keyboard&LH_BIN=1&_sop=15", headers=HEADERS)
 items = extract_search_results(html)
 print(f"{len(items)} items")
 for item in items[:5]:
@@ -343,7 +349,9 @@ def extract_item_detail(html):
 
 **Field-tested on item 167040158614:**
 ```python
-html = http_get("https://www.ebay.com/itm/167040158614", headers=HEADERS)
+html = safe_get("https://www.ebay.com/itm/167040158614", headers=HEADERS)
+if html is None:
+    raise RuntimeError("eBay blocked the item request")
 detail = extract_item_detail(html)
 # {
 #   'listing_id':   '167040158614',
@@ -395,8 +403,8 @@ Use `_pgn=N` (confirmed working, returns ~65–88 items per page):
 ```python
 for page in range(1, 4):
     url = f"https://www.ebay.com/sch/i.html?_nkw=laptop&LH_BIN=1&_sop=15&_pgn={page}"
-    html = http_get(url, headers=HEADERS)
-    if is_blocked(html):
+    html = safe_get(url, headers=HEADERS)
+    if html is None:
         break
     items = extract_search_results(html)
     print(f"Page {page}: {len(items)} items")
@@ -420,11 +428,12 @@ in a session, eBay returns "Pardon Our Interruption" for all subsequent requests
 
 ## Practical Workflow
 
+Run the helper and extractor definitions above before this example. A blocked request returns `None`; stop and inspect the browser before trying again.
+
 ### Scrape a search and follow top items
 
 ```python
 import re, json, time
-from helpers import http_get
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -432,11 +441,11 @@ HEADERS = {
 }
 
 # Step 1: Search
-html = http_get(
+html = safe_get(
     "https://www.ebay.com/sch/i.html?_nkw=mechanical+keyboard&LH_BIN=1&_sop=15&LH_ItemCondition=1000",
     headers=HEADERS
 )
-if is_blocked(html):
+if html is None:
     raise RuntimeError("Rate limited — wait 60-120s and retry")
 
 items = extract_search_results(html)
@@ -446,8 +455,8 @@ print(f"Found {len(items)} items")
 details = []
 for item in items[:5]:
     time.sleep(3)
-    detail_html = http_get(item['url'], headers=HEADERS)
-    if is_blocked(detail_html):
+    detail_html = safe_get(item['url'], headers=HEADERS)
+    if detail_html is None:
         print(f"Blocked on item {item['listing_id']}, stopping")
         break
     detail = extract_item_detail(detail_html)
