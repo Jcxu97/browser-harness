@@ -6,7 +6,7 @@ Search URL (no login needed):
 https://www.airbnb.com/s/San-Francisco--CA--United-States/homes?refinement_paths%5B%5D=%2Fhomes&checkin=2026-10-11&checkout=2026-11-11&adults=2&min_bedrooms=2&room_types%5B%5D=Entire%20home%2Fapt&ne_lat=37.812&ne_lng=-122.405&sw_lat=37.778&sw_lng=-122.460&search_by_map=true&zoom=14&search_type=filter_change
 ```
 
-- Add `price_max` and `price_filter_num_nights` only when the user requests a price limit.
+- Add `price_max` and `price_filter_num_nights` only when the user requests a price limit. Set `price_filter_num_nights` to the number of nights between `checkin` and `checkout`.
 - With a 28+ night range, cards show a **monthly** figure ("$5,860 → $5,679 monthly") that
   already includes fees; `price_max` is applied to that monthly total, not per night.
 - `ne_*/sw_*` + `search_by_map=true` pins the search to the box; the results header reads
