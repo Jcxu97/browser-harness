@@ -1,5 +1,7 @@
 # Vercel — project identity, visitor analytics and request traffic
 
+The contributor supplied these observations without a validation date. Verify current labels and routes in the visible dashboard.
+
 ## Resolve the actual project first
 
 - Team overview: `/{team_slug}`.

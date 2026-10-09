@@ -34,6 +34,4 @@ diagram (figure) pages.
 ## Traps
 
 - Diagram footnote `N01` callouts = parts not supplied individually.
-- Fitment differs across trims of the same model line (e.g. TX500h rack =
-  44250-0E230, TX550h+ rack = 44250-0E220) — always resolve via the VIN, not
-  the model name.
+- Fitment differs across trims of the same model line. Resolve the exact part through the VIN-specific catalog. Verify its production-date applicability before ordering.

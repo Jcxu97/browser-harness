@@ -246,7 +246,7 @@ Because property detail pages are blocked (403), you lose:
 - Nearby comparable sales (comps)
 - Agent contact info
 
-**To get these**, you must navigate to the `/homedetails/` URL in a browser session. The browser is not blocked (Zillow relies on JS challenges and fingerprinting that only trigger in browser context).
+Try the `/homedetails/` URL in an authorized browser session. Browser access can also fail. See the photo-gallery section below for observed alternatives.
 
 ---
 
@@ -414,7 +414,7 @@ If you need property data without scraping Zillow or Redfin at scale:
 
 - **`price` field is `None` for sold and rental multi-unit listings.** Use `unformattedPrice` for for-sale, `hdpData.homeInfo.priceForHDP` for sold, and `minBaseRent`/`maxBaseRent` for rentals.
 
-- **`/homedetails/` is unconditionally blocked.** Tested with full browser headers, Referer, Sec-Fetch-* headers — all return HTTP 403. Only the browser bypasses this.
+- **`/homedetails/` can reject both HTTP clients and browsers.** The observed HTTP requests returned 403 despite browser headers. Verify the actual response before choosing another source.
 
 - **41 listings per page, hardcoded.** Zillow always returns exactly 41 results per page from `listResults`. `mapResults` was empty in all tests (server-side response only).
 
@@ -444,10 +444,9 @@ Field-tested 2026-07-31. Task: "download all listing photos" for one address whe
    The listing page (`/for-sale/` variant for sold homes) embeds every gallery image as
    `https://pi.movoto.com/p/101/<MLS#>_0_<hash>.jpeg` — plain curl with a Chrome UA
    returns all of them (a 54-photo gallery came back complete). ~1150px is the stored
-   size; there is no larger variant on that CDN.
+   size in that observation; verify current dimensions rather than assuming a maximum.
 2. **Redfin CDN sequential probe — covers only, not the gallery.** Sold-home pages
-   render just photo 1, but the CDN pattern `ssl.cdn-redfin.com/photo/27/bigphoto/
-   <last3-of-MLS>/<MLS#>_<n>.jpg` answers HEAD requests. In practice only `_0`/`_1`
+   render just photo 1, but the CDN pattern `ssl.cdn-redfin.com/photo/27/bigphoto/<last3-of-MLS>/<MLS#>_<n>.jpg` answers HEAD requests. In practice only `_0`/`_1`
    exist for sold listings — the rest 404. Don't waste time probing 0-60.
 3. **Compass/Coldwell Banker — server-render one photo only.** Sold-listing galleries
    lazy-load behind auth'd XHR; `--virtual-time-budget` headless rendering still yields
@@ -458,4 +457,4 @@ Field-tested 2026-07-31. Task: "download all listing photos" for one address whe
 
 A failed Redfin request does not establish that every `stingray` endpoint fails. Test the documented `/stingray/api/gis` search separately.
 
-Movoto search pages also contain image URLs for other listings. Filter by the target MLS number first. Then group image variants by their image identifier and retain the largest variant. Do not merge different photos merely because their dimensions match.
+Movoto search pages also contain image URLs for other listings. Filter by the target MLS number first. For the observed `/p/101/<MLS#>_0_<hash>.jpeg` shape, use the MLS number and `<hash>` together to identify a photo. Compare dimensions only after confirming that two URLs represent that same photo. Do not merge different photos merely because their dimensions match.
