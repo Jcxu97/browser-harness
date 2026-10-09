@@ -4,7 +4,7 @@
 
 - Application: `https://app.smartlead.ai/`.
 - Sender accounts: `/app/email-accounts`.
-- Account details: `/app/email-account/<id>/overview`, `/general`, `/warmup`, `/management`, and `/campaigns`.
+- Account tabs use `/app/email-account/<id>/<tab>`. Replace `<tab>` with `overview`, `general`, `warmup`, `management`, or `campaigns`.
 - The profile menu exposes Settings, then Subscription for plan selection.
 - New accounts require a verification email before onboarding. The verification link opens a new tab; keep it in the same browser context as the mailbox and Microsoft login.
 
