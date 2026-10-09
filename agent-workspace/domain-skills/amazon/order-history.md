@@ -47,8 +47,13 @@ stop. This is the difference between a complete run and a short one that looks c
 ```python
 import re
 count_text = js("document.querySelector('.num-orders')?.innerText")  # '186 orders' / '1 order'
-expected = int(re.sub(r"[^\d]", "", count_text or "0") or 0)
+count_match = re.fullmatch(r"\s*(\d{1,3}(?:,\d{3})+|\d+)\s+orders?\s*", count_text or "")
+if not count_match:
+    raise RuntimeError("Order count is missing or invalid; inspect the page before extracting orders")
+expected = int(count_match.group(1).replace(",", ""))
 ```
+
+If Amazon shows a separate empty-state message, verify that message before recording zero orders.
 
 Stop on the pagination control, not on a short page — `.a-last` carries `a-disabled` on the
 final page and the whole `.a-pagination` block is absent when a year fits on one page:
