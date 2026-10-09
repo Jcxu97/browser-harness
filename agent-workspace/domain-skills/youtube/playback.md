@@ -69,7 +69,7 @@ opened = js("""
 (() => {
   const leaf = [...document.querySelectorAll('body *')]
     .find(el => el.children.length === 0 &&
-      el.textContent.trim() === 'Show transcript' &&
+      (el.innerText || '').trim() === 'Show transcript' &&
       el.getClientRects().length);
   const button = leaf?.closest('button, tp-yt-paper-button');
   if (!button) return false;
