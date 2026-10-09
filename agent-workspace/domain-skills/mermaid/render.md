@@ -27,9 +27,7 @@ def mermaid_live_url(code: str) -> str:
     return "https://mermaid.live/edit#pako:" + data
 ```
 
-`zlib.compress` emits the zlib-wrapped stream `pako.inflate` expects (header + adler32) —
-this matches mermaid.live's `pako.deflate`. Stripping the `=` padding is fine; the
-decoder is tolerant.
+This example uses a zlib-wrapped stream and removes base64 padding. Verify the loaded editor code after navigation; a decoder change can invalidate the URL.
 
 ## Confirming the render (headless-safe, no screenshot needed)
 
@@ -37,17 +35,29 @@ decoder is tolerant.
 Check the page structure for a graph, then inspect the image when appearance matters.
 
 ```python
-new_tab(mermaid_live_url(code)); wait_for_load()
-import time; time.sleep(2)   # mermaid renders client-side after load
-print(js("""(() => {
-  const svgs=[...document.querySelectorAll('svg[id^="graph-"]')]
-    .filter(s => s.getClientRects().length)
-    .map(s=>({id:s.id,nodes:s.querySelectorAll('g').length}));
-  return JSON.stringify({rendered:svgs,
-    syntaxErr:/syntax error|parse error/i.test(document.body.innerText||'')});
-})()"""))
-# rendered:[{id:"graph-247",nodes:136}] + syntaxErr:false  => parses & renders
-# rendered:[] (or only tiny svgs) + syntaxErr:true         => broken Mermaid
+import time
+
+new_tab(mermaid_live_url(code))
+wait_for_load()
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    state = js("""(() => {
+      const graphs = [...document.querySelectorAll('svg[id^="graph-"]')]
+        .filter(el => el.getClientRects().length);
+      const editor = document.querySelector('.cm-content');
+      return {
+        rendered: graphs.length > 0,
+        editorCode: editor ? [...editor.querySelectorAll('.cm-line')].map(el => el.textContent).join('\\n') : null,
+        syntaxErr: /syntax error|parse error/i.test(document.body.innerText || '')
+      };
+    })()""")
+    if state["syntaxErr"]:
+        raise RuntimeError("The editor reports a Mermaid syntax error")
+    if state["rendered"] and state["editorCode"] == code:
+        break
+    time.sleep(0.25)
+else:
+    raise RuntimeError("The requested diagram did not render with matching editor code")
 ```
 
 Check that the editor contains the submitted code before treating a graph as the requested result.
@@ -57,7 +67,7 @@ Do not reject small diagrams based on group count.
 ## Traps
 
 - **`#pako:` is a hash, not a query.** `wait_for_load()` won't catch the client-side
-  render — add a short `time.sleep`.
+  render. Poll the editor and graph until the bounded deadline.
 - **Do not trust error text alone.** Require a visible graph SVG that matches the submitted code.
   A blank editor (bad encoding) shows neither an error nor a graph.
 - Theme/look-and-feel never affects parse success; keep the `mermaid` state minimal.
