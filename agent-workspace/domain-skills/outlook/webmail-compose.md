@@ -16,7 +16,7 @@ Typing an address initially leaves the recipient suggestion open. Select the dis
 
 Do not emit a literal tab character when moving between recipient fields. Some keyboard helpers send a `char` event for Tab as well as key events; Outlook can store that character as an invalid empty recipient. Use raw Tab keyDown/keyUp events without text or char events.
 
-The invalid-address banner offers Remove recipient, but inspect the editor afterward: a raw whitespace character can remain and recreate the invalid entry on the next send attempt. If ordinary editing fails, select the affected editor's contents with a DOM Range. Then call `document.execCommand('delete')`. This cleared the editable content in the observed browser. Verify the editor contents afterward. Recheck every recipient field before sending.
+The invalid-address banner offers Remove recipient, but inspect the editor afterward: a raw whitespace character can remain and recreate the invalid entry on the next send attempt. If ordinary editing fails, focus the affected editor and create a DOM Range over its contents. Clear `window.getSelection()` with `removeAllRanges()`, then add the range with `addRange(range)`. Then call `document.execCommand('delete')`. This cleared the editable content in the observed browser. Verify the editor contents afterward. Recheck every recipient field before sending.
 
 ## Verification
 
