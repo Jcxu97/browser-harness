@@ -112,7 +112,7 @@ This is a `<div>`, not a `<button>`. Click it with `click_at_xy()`:
 rect = js("JSON.stringify(document.querySelector('.home-search-form-submit').getBoundingClientRect())")
 if rect:
     r = json.loads(rect)
-    click_at_xy(r.x + r.width/2, r.y + r.height/2)
+    click_at_xy(r["x"] + r["width"] / 2, r["y"] + r["height"] / 2)
 ```
 
 ---
