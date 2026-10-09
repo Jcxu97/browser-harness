@@ -456,7 +456,6 @@ Field-tested 2026-07-31. Task: "download all listing photos" for one address whe
 4. **Estately** — dead for sold homes (redirects to city search). **Wayback** — listing
    pages are almost never archived (CDX returns empty).
 
-Traps: Redfin's `stingray` API 403s from datacenter IPs even when page HTML fetches
-fine; Movoto search-page HTML also contains *other* listings' `pi.movoto.com` URLs —
-filter by the target MLS number, then dedupe by image dimensions (small 480/960
-variants of the cover ship alongside the 1150px set).
+A failed Redfin request does not establish that every `stingray` endpoint fails. Test the documented `/stingray/api/gis` search separately.
+
+Movoto search pages also contain image URLs for other listings. Filter by the target MLS number first. Then group image variants by their image identifier and retain the largest variant. Do not merge different photos merely because their dimensions match.
