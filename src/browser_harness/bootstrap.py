@@ -76,6 +76,10 @@ def safe_globals():
     def upload(selector, file_paths):
         return _with_self_heal(lambda t: _sw.upload_agent(t, selector, file_paths), replayable=False)
 
+    def upload_via_chooser(selector, file_paths, timeout=10.0):
+        return _with_self_heal(lambda t: _sw.upload_via_chooser_agent(
+            t, selector, file_paths, timeout=timeout), replayable=False)
+
     def new_tab(url="about:blank"):
         """Open url in an agent tab and make it current. The current tab is
         reused while it still shows its placeholder page."""
@@ -108,6 +112,7 @@ def safe_globals():
         "goto": goto, "eval_js": eval_js, "snap": snap, "snapshot": snapshot,
         "ref_for": ref_for, "click_ref": click_ref, "fill_ref": fill_ref,
         "shot": shot, "click_at": click_at, "send_keys": send_keys, "hotkey": hotkey,
-        "fill": fill, "upload": upload, "new_tab": new_tab, "close_tab": close_tab,
+        "fill": fill, "upload": upload, "upload_via_chooser": upload_via_chooser,
+        "new_tab": new_tab, "close_tab": close_tab,
         "show_window": show_window, "hide_window": hide_window,
     }

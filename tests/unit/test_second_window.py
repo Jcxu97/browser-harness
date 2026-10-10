@@ -231,6 +231,39 @@ def test_new_tab_opens_in_the_agent_window_without_activation(chrome):
     assert action == "create_tab" and params["windowId"] == wid and params["active"] is False
 
 
+def test_next_process_reuses_the_kept_session(chrome, monkeypatch):
+    """Detaching ends the focus emulation, and apps reload their forms on focus."""
+    tid = sw.new_agent_tab("https://site.example/form")
+    sid = sw._session_for(tid)
+    sw._exit_cleanup()
+    assert chrome.sessions.get(sid) == tid
+    monkeypatch.setattr(sw, "_SESSIONS", {})  # a new process has no sessions yet
+    attached = len(chrome.sessions)
+    assert sw._session_for(tid) == sid
+    assert len(chrome.sessions) == attached
+
+
+def test_upload_via_chooser_clicks_and_answers_the_chooser(chrome, monkeypatch):
+    tid = sw.ensure_agent_tab()
+    sid = sw._session_for(tid)
+    calls, events = [], [[], [{"method": "Page.fileChooserOpened", "session_id": sid,
+                               "params": {"backendNodeId": 77, "mode": "selectSingle"}}]]
+
+    def cdp(method, session_id=None, _response_timeout=None, **p):
+        calls.append((method, p))
+        if method == "Runtime.evaluate" and p["expression"].startswith("document.querySelector"):
+            return {"result": {"objectId": "btn"}}
+        if method == "Runtime.callFunctionOn":
+            return {"result": {"value": [50, 60]}}
+        return chrome.cdp(method, session_id=session_id, **p)
+
+    monkeypatch.setattr(sw, "cdp", cdp)
+    monkeypatch.setattr(sw, "_raw_send", lambda req, response_timeout=None: {"events": events.pop(0) if events else []})
+    assert sw.upload_via_chooser_agent(tid, "button.update", "C:/f.zip") == "uploaded 1 file(s)"
+    assert (tid, "mousePressed", 50, 60) in chrome.clicks
+    assert ("DOM.setFileInputFiles", {"files": ["C:/f.zip"], "backendNodeId": 77}) in calls
+
+
 def test_agent_tab_pages_keep_new_tabs_in_the_same_tab(chrome):
     """A page that opens a tab makes Chrome show and activate the window."""
     tid = sw.ensure_agent_tab()

@@ -52,6 +52,10 @@ PLACEHOLDER_REAP_AGE_SECONDS = 60
 SAME_TAB_JS = r"""(() => {
   if (window.__bhSameTab) return;
   window.__bhSameTab = true;
+  // A "Leave site?" prompt is a native dialog: Chrome shows the agent window
+  // over the user's app for it, and Page.navigate waits until someone answers.
+  // Capture listeners on window run before the page's own handlers.
+  window.addEventListener("beforeunload", (e) => e.stopImmediatePropagation(), true);
   window.open = function (url) {
     if (url) location.assign(new URL(String(url), location.href).href);
     return null;
@@ -685,6 +689,11 @@ def _session_for(tid):
     sid = _SESSIONS.get(tid)
     if sid:
         return sid
+    sid = _kept_session(tid)
+    if sid:
+        _SESSIONS[tid] = sid
+        _register_exit()
+        return sid
     sid = _attach(tid)
     for domain in ("Page", "DOM", "Network"):
         try:
@@ -701,9 +710,32 @@ def _session_for(tid):
         cdp("Runtime.evaluate", session_id=sid, expression=SAME_TAB_JS)
     except Exception:
         pass
+    try:
+        # A native file chooser is a modal window over the user's app, and no
+        # helper can drive it. upload_via_chooser_agent() answers the event.
+        cdp("Page.setInterceptFileChooserDialog", session_id=sid, enabled=True)
+    except Exception:
+        pass
     _SESSIONS[tid] = sid
     _register_exit()
     return sid
+
+
+def _kept_session(tid):
+    """The session that an earlier process kept for tid, when it still works.
+
+    Detaching ends the focus emulation, so between two processes the page saw
+    blur and hidden, then focus and visible. Many apps reload their data on
+    focus and drop unsaved form input. Keeping the session avoids this."""
+    rec = next((r for r in _load_state().get("agent_tabs", []) if r.get("tid") == tid), None)
+    sid = (rec or {}).get("session")
+    if not sid:
+        return None
+    try:
+        cdp("Runtime.evaluate", session_id=sid, expression="1", returnByValue=True)
+        return sid
+    except Exception:
+        return None
 
 
 def _call(tid, method, _response_timeout=None, **params):
@@ -810,6 +842,8 @@ def _exit_cleanup():
                     if r["tid"] in pages and (r.get("window") or (not keep and (placeholder or unused))):
                         to_close.append(r["tid"])
                         continue
+                    if r["tid"] in _SESSIONS:
+                        r["session"] = _SESSIONS.pop(r["tid"])
                 kept.append(r)
             state["agent_tabs"] = kept
             _save_state(state)
@@ -1161,6 +1195,43 @@ def upload_agent(agent_tid, selector, file_paths):
     _call(agent_tid, "DOM.setFileInputFiles", files=[str(p) for p in file_paths], nodeId=node_id)
     _touch(agent_tid)
     return f"uploaded {len(file_paths)} file(s)"
+
+
+_CENTER_FN = """function() {
+  this.scrollIntoView({block: 'center'});
+  const r = this.getBoundingClientRect();
+  return [r.x + r.width / 2, r.y + r.height / 2];
+}"""
+
+
+def upload_via_chooser_agent(agent_tid, selector, file_paths, timeout=10.0):
+    """Click the element that opens a file chooser, then give the chooser the files.
+
+    Use it when upload_agent() on the <input type=file> changes nothing: many
+    apps arm their upload state in the button's click handler. The click is a
+    real mouse event, because a JS click() has no user gesture and opens no chooser."""
+    if isinstance(file_paths, (str, os.PathLike)):
+        file_paths = [file_paths]
+    sid = _session_for(agent_tid)
+    cdp("Page.setInterceptFileChooserDialog", session_id=sid, enabled=True)
+    obj = _call(agent_tid, "Runtime.evaluate", expression=f"document.querySelector({json.dumps(selector)})")
+    object_id = (obj.get("result") or {}).get("objectId")
+    if not object_id:
+        raise RuntimeError(f"upload_via_chooser: no element matched selector {selector!r}")
+    x, y = _call(agent_tid, "Runtime.callFunctionOn", objectId=object_id,
+                 functionDeclaration=_CENTER_FN, returnByValue=True)["result"]["value"]
+    _raw_send({"meta": "drain_events"})
+    click_at_agent(agent_tid, x, y)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for e in _raw_send({"meta": "drain_events"}).get("events", []):
+            if e.get("method") == "Page.fileChooserOpened" and e.get("session_id") in (sid, None):
+                _call(agent_tid, "DOM.setFileInputFiles", files=[str(p) for p in file_paths],
+                      backendNodeId=e["params"]["backendNodeId"])
+                _touch(agent_tid)
+                return f"uploaded {len(file_paths)} file(s)"
+        time.sleep(0.2)
+    raise RuntimeError(f"upload_via_chooser: clicking {selector!r} opened no file chooser in {timeout:.0f}s")
 
 
 # Sets the value through the prototype setter, so React and Vue see the change.

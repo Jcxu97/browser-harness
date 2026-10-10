@@ -58,6 +58,7 @@ These names are pre-imported:
 | `shot(path, full=False)` | Screenshot. |
 | `click_at(x, y)`, `send_keys(["Tab", "Enter"])`, `hotkey("Control+A")` | Raw input. |
 | `fill(selector, value)`, `upload(selector, paths)` | Forms and file inputs. |
+| `upload_via_chooser(selector, paths)` | Click the button that opens a file chooser and give it the files. Use it when `upload()` on the input changes nothing. |
 | `show_window()`, `hide_window()` | Show the agent window for a login, then hide it. |
 | `agent_tab` | Target id of the current agent tab. |
 
@@ -70,6 +71,11 @@ Tab life cycle:
 2. The agent window keeps at most 15 agent tabs. Above that, BH closes the free
    tabs that were used least recently.
 3. When you no longer need a page, call `close_tab()`.
+4. BH keeps the CDP session of a kept tab for the next process. The page does
+   not see blur and focus between two calls, so unsaved form input stays.
+5. Agent tabs never show a "Leave site?" prompt, and a native file chooser
+   never opens. Use `upload_via_chooser()` for a chooser. Save a form before
+   you leave its page, because BH does not ask.
 
 ## Local Chrome
 
@@ -289,6 +295,8 @@ the companion extension in `extension/`.
 
 - `chrome://inspect/#remote-debugging` must be enabled for local Chrome control.
 - On macOS, if local Chrome shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper.
+- A page without styles and with 403 answers that carry `cf-mitigated: challenge` hit a Cloudflare challenge on its scripts. `goto()` one of the blocked script URLs once; the challenge passes in the real Chrome. Then load the page again.
+- To give a long string to `eval_js`, put it into a `window` variable with `json.dumps` first. When Python turns a `\n` into a real line break inside a JavaScript string literal, the script does not parse.
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.
