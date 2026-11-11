@@ -47,3 +47,18 @@ Then click the first `Save` button and check the public page.
 
 - When you leave the files page with an unsaved upload, Chrome shows a "Leave site?" prompt. See `interaction-skills/dialogs.md`.
 - The checkboxes are headless UI elements (`role=checkbox`, `aria-checked`). Find them through their `label`, click them, and read `aria-checked` to verify.
+
+## Create a new mod page
+
+A full script set (create the draft, fill each step, publish, check) is in the private repo `Jcxu97/bili-game-pipeline`, folder `tools/nexus`. The steps below are the parts of the form that cause problems.
+
+1. Open `https://www.nexusmods.com/?uploadMod=true`. The "Upload mod" dialog on a game page can show "Something went wrong" and load no categories.
+2. Fill `#mod-name` and `#short-description` in the dialog. Select the game and the category in the two comboboxes, then click `Create draft`. The page goes to `.../mods/<id>/edit/general`.
+3. Wait until `#mod-version` and `window.sceditor` exist before you fill the General step.
+4. "Generative AI usage" is required. Select the boxes that are true for the mod.
+5. Media needs at least one gallery image. The page has two image inputs with the same `accept`. The first input is the header, the second input is the gallery.
+6. Files: set the zip on `input[type=file][accept*=".zip"]`, wait for `#display-name`, set `#display-name` and `#file-version`, then click `Save file` when it is enabled.
+7. Requirements: select "Mod requirements (legacy)" to add External resources (`#external-req-name`, `-url`, `-note`).
+8. Click `Publish`, then `Publish mod` in the dialog. The URL ends with `?published=1`.
+
+Headless UI checkboxes and radio buttons change on a plain `click()`. A full PointerEvent chain changes them two times, so the state does not change. Comboboxes are the opposite: click their options with the PointerEvent chain. To find a radio button, select `[id^=headlessui-radio-]`. The radiogroup element contains the same text and matches first.
