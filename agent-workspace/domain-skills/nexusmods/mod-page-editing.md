@@ -6,6 +6,8 @@
 
 When the edit page shows only a large image and no form, Cloudflare blocked its scripts. The scripts under `/_next/static/` answer 403 with `cf-mitigated: challenge`. Open one blocked script URL as a page once. The challenge passes in a real Chrome. Then load the edit page again.
 
+The challenge can also block the API calls of the page. Then the page shows "Failed to fetch mod settings (403)". Check all 403 resources, not only `/_next/static/`. Open `https://www.nexusmods.com/api/flamework/mods/settings?gameId={game_id}&modId={id}` as a page once. When it shows JSON, load the edit page again.
+
 ```python
 bad = js("""performance.getEntriesByType('resource')
   .filter(r => r.responseStatus === 403 && r.name.includes('/_next/static/'))
@@ -33,13 +35,13 @@ Then click the first `Save` button and check the public page.
 
 ## Replace the main file with a new version
 
-1. On `.../edit/files`, the `Update` button of the file row is `button.nxm-button`. A tab of the category filter has the same text, so do not select by text only.
+1. On `.../edit/files`, the `Update` button of the file row is `button.nxm-button`. A tab of the category filter has the same text, so do not select by text only. The file list is not a `table`, so `closest('tr')` finds nothing. Select `button.nxm-button` with the text `Update`.
 2. The button opens a native file chooser. Answer it with the chooser recipe in `interaction-skills/uploads.md`.
 3. A form opens. `Update existing file` is selected and names the old file. Set these fields:
    - the checkbox `Archive existing file`: the old file moves to the File archive section, not to Old files
    - the checkbox `Update mod version to match this file's version`
    - `input#display-name`, `input#file-version`
-   - `textarea#file-changelog-text`, one entry per line
+   - `textarea#file-changelog-text`, one entry per line. The textarea is not there until you click the `Add changelog` button.
 4. `Save file` stays disabled for 10 to 20 seconds while the server processes the upload. Wait until it is enabled.
 5. The public files tab shows "Virus scanning is in progress" for some minutes. Users cannot download the file before the scan ends.
 
